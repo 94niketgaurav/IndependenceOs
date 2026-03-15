@@ -190,7 +190,7 @@ Example:
   → 27310 is a component of 27447 — can't bill both
 ```
 
-#### 2c. LCD / NCD (Medical Necessity Coverage)
+#### 2c. LCD (Local Coverage Determination) / NCD (National Coverage Determination) (Medical Necessity Coverage)
 
 Every CPT procedure has a list of ICD-10 diagnosis codes that make it **medically necessary**. If the diagnosis on the claim doesn't appear on that list, the payer will deny for lack of medical necessity.
 
@@ -202,7 +202,7 @@ CPT 72148 (MRI lumbar spine, without contrast):
 Check: Do the ICD-10 codes on this claim appear in the LCD for each CPT?
 ```
 
-**Data source**: CMS LCD database (downloadable per MAC/region). ~2,000 LCDs covering thousands of CPT-ICD pairs.
+**Data source**: CMS (Centres for medical services) LCD database (downloadable per MAC/region). ~2,000 LCDs covering thousands of CPT-ICD pairs.
 
 **Complexity**: LCDs vary by MAC (Medicare Administrative Contractor) — the rules for New England are different from Texas. The clinic's geographic region determines which LCD applies.
 
