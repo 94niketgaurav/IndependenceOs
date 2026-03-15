@@ -300,17 +300,24 @@ OPEN ─────────────────────────
   │ outreach sent                                      │
   ▼                                                    │
 IN_PROGRESS ──► appointment_made ──► service_completed─┘
-  │
-  │ patient declined    │ result pending timeout
-  ▼                     ▼
-PATIENT_DECLINED       OPEN (re-opens)
-  │
+  │              │
+  │ patient      │ result pending timeout
+  │ declined     ▼
+  │          OPEN (re-opens)
   ▼
-EXCLUDED (if clinical contraindication confirmed)
+PATIENT_DECLINED
+  │                     │
+  │ clinical             │ non-medical decline,
+  │ contraindication     │ retry allowed after
+  │ confirmed            │ waiting period
+  ▼                     ▼
+EXCLUDED ────────────► OPEN (if exclusion reason manually revoked)
 ```
 
-Terminal states: `CLOSED`, `EXCLUDED`
+Terminal states: `CLOSED`, `EXCLUDED` (unless exclusion is revoked)
 Re-openable states: `CLOSED` (on annual measure reset for recurring measures)
+                    `EXCLUDED` (if exclusion reason is manually revoked via clinical review)
+                    `PATIENT_DECLINED` → `OPEN` (if patient changes mind; non-medical decline)
 
 ---
 
@@ -594,6 +601,8 @@ NoteSignedEvent(
     date_of_service: date,
     icd10_codes: list[str],
     cpt_codes: list[str],
+    result_value: str | None,    # e.g., "6.5" for A1C — needed for result-required measures
+    result_units: str | None,    # e.g., "%" or "mmHg"
     signed_at: datetime
 )
 
@@ -605,6 +614,8 @@ ClaimPaidEvent(
     date_of_service: date,
     icd10_codes: list[str],
     cpt_codes: list[str],
+    result_value: str | None,    # e.g., A1C value on lab claim — for result-required measures
+    result_units: str | None,
     paid_at: datetime
 )
 
@@ -644,6 +655,43 @@ class PatientGapProfile:
     linked_identity_sources: list[PatientIdentityLink]
 ```
 
+### 10.1a Enumerations
+
+```python
+from enum import Enum, IntEnum
+
+class GapStatus(str, Enum):
+    OPEN             = "OPEN"
+    IN_PROGRESS      = "IN_PROGRESS"
+    CLOSED           = "CLOSED"
+    EXCLUDED         = "EXCLUDED"
+    PATIENT_DECLINED = "PATIENT_DECLINED"
+
+class CampaignStatus(str, Enum):
+    PENDING           = "PENDING"
+    OUTREACH_SCHEDULED = "OUTREACH_SCHEDULED"
+    CONTACTED         = "CONTACTED"
+    APPOINTMENT_MADE  = "APPOINTMENT_MADE"
+    SERVICE_COMPLETED = "SERVICE_COMPLETED"
+    EXHAUSTED         = "EXHAUSTED"
+    DECLINED          = "DECLINED"
+
+class TrustLevel(IntEnum):
+    DETERMINISTIC   = 1   # explicit MRN / member ID cross-reference
+    HIGH_CONFIDENCE = 2   # exact DOB + sex + last name (Jaro-Winkler ≥ 0.95)
+    PROBABLE        = 3   # 3-of-5 fuzzy match — requires human review
+    UNLINKED        = 4   # no match found
+
+class EvidenceType(str, Enum):
+    LAB_RESULT           = "LAB_RESULT"
+    NOTE_SIGNED          = "NOTE_SIGNED"
+    CLAIM_PAID           = "CLAIM_PAID"
+    HIE_PROCEDURE        = "HIE_PROCEDURE"
+    IIS_IMMUNIZATION     = "IIS_IMMUNIZATION"
+    PROVIDER_ATTESTATION = "PROVIDER_ATTESTATION"
+    PATIENT_SELF_REPORT  = "PATIENT_SELF_REPORT"
+```
+
 ### 10.2 Care Gap
 
 ```python
@@ -654,11 +702,14 @@ class CareGap:
     measure_id: str                # "BCS-E", "CDC-HbA1c", etc.
     hedis_year: int
     payer_id: str | None           # None = HEDIS standard, str = payer-specific
-    status: GapStatus              # OPEN, IN_PROGRESS, CLOSED, EXCLUDED, PATIENT_DECLINED
+    status: GapStatus              # see enum above
     opened_at: datetime
     closed_at: datetime | None
     not_due_until: date | None     # suppresses outreach until this date
     priority_score: float
+    reopened_count: int            # incremented on each CLOSED → OPEN transition
+    last_trigger_event: str | None # "NOTE_SIGNED", "CLAIM_PAID", "LAB_RESULT", "ANNUAL_RESET", etc.
+    last_trigger_at: datetime | None
     evidence: list[GapEvidence]    # append-only
     outreach_campaign: OutreachCampaign | None
     exclusion_reason: str | None
@@ -670,14 +721,15 @@ class CareGap:
 class GapEvidence:
     evidence_id: UUID
     gap_id: UUID
-    evidence_type: EvidenceType    # LAB_RESULT, NOTE_SIGNED, CLAIM_PAID,
-                                   # HIE_PROCEDURE, IIS_IMMUNIZATION,
-                                   # PROVIDER_ATTESTATION, PATIENT_SELF_REPORT
+    evidence_type: EvidenceType    # see enum above
     source_id: str                 # encounter_id, claim_id, hl7_message_id, etc.
+    source_system: str             # "EHR", "QUEST_HL7", "LABCORP_HL7", "HIE",
+                                   # "IIS", "BCBS_CLAIM", "ATTESTATION" — data provenance
     service_date: date
     cpt_code: str | None
     loinc_code: str | None
-    result_value: str | None       # for result-required measures
+    result_value: str | None       # e.g., "6.5" for A1C — required for result-required measures
+    result_units: str | None       # e.g., "%", "mmHg", "mg/dL"
     confidence: float              # 1.0 for deterministic, lower for probabilistic
     received_at: datetime
     applied_to_numerator: bool
@@ -690,11 +742,11 @@ class OutreachCampaign:
     campaign_id: UUID
     gap_id: UUID
     patient_id: UUID
-    status: CampaignStatus         # PENDING, SCHEDULED, CONTACTED, APPOINTMENT_MADE,
-                                   # SERVICE_COMPLETED, EXHAUSTED, DECLINED
+    status: CampaignStatus         # see enum above
     channel_sequence: list[OutreachStep]
     current_step: int
-    language: str                  # "en", "es", "vi", etc.
+    language: str                  # "en", "es", "vi", etc. — campaign-level language
+    patient_preferred_channel: Channel | None  # patient's stated preference; reorders sequence
     created_at: datetime
     last_contact_at: datetime | None
     next_contact_at: datetime | None
@@ -719,9 +771,9 @@ class PatientIdentityLink:
     patient_id: UUID               # internal ID
     source_system: str             # "EHR", "BCBS_IL", "IL_IIS", "COMMONWELL_HIE"
     source_patient_id: str         # ID in that system
-    trust_level: int               # 1=deterministic, 2=high-conf, 3=probable
+    trust_level: TrustLevel        # see TrustLevel enum — type-safe (1=deterministic, 2=high-conf, 3=probable)
     created_at: datetime
-    approved_by: UUID | None       # required for trust_level=3
+    approved_by: UUID | None       # required for TrustLevel.PROBABLE (level 3)
     revocable: bool                # False for level 1-2, True for level 3
 ```
 
@@ -770,6 +822,11 @@ class MeasureSpec:
 | EC-20 | Lab result never arrives (lost specimen) | Gap stays incorrectly IN_PROGRESS indefinitely | Pending result timeout per test type. On timeout: gap → OPEN; provider notified; new outreach NOT auto-triggered |
 | EC-21 | Annual measure reset triggers early re-outreach | Patient who closed gap 6 weeks ago receives outreach | `not_due_until` date calculated based on last closure date; outreach suppressed until date passes |
 | EC-22 | Service performed at non-integrated facility | Gap stays open indefinitely | Provider attestation workflow satisfies HEDIS hybrid method; audit trail required |
+| EC-23 | NCQA publishes mid-year HEDIS erratum changing exclusion/numerator criteria | Gaps evaluated under wrong rules; potential revenue/quality reporting impact | Spec versioning allows fast load of corrected spec with new effective_date; trigger targeted recalculation for all patients in affected measure; audit log of version change; provider notification if gap status changed |
+| EC-24 | Patient enrolled with multiple payers simultaneously (dual coverage) | Wrong payer spec applied; measure evaluated under incorrect contract rules | Gap records maintained per measure-payer combination (one gap per payer overlay); primary payer configured per practice; outreach de-duplicated across payer gaps |
+| EC-25 | Two closure events for the same gap arrive concurrently (race condition) | Duplicate closure events; potential double-counting in HEDIS reports | GapEvidence is append-only; idempotent gap closure (status stays CLOSED on second event); all evidence stored with timestamp; Quality Reporting Engine counts unique gap closures, not evidence events |
+| EC-26 | Patient is excluded clinically after service was already ordered (gap mid-closure) | Service completes but exclusion should prevent it from counting | Exclusion check re-runs on all incoming evidence; if excluded after service, gap → EXCLUDED (status overrides IN_PROGRESS); evidence stored but applied_to_numerator = false; provider notified |
+| EC-27 | Pending result timeout fires, then late result arrives within minutes | Double closure event; provider received false "result missing" alert | Pending result timeout is idempotent; late result arriving within 12 hours of timeout triggers re-closure with audit note "late arrival post-timeout"; provider alert auto-resolved when result received |
 
 ---
 
@@ -882,16 +939,16 @@ While the three systems are being co-developed, direct API calls have lower over
                     ┌─────────────────────────────┐
                     │                             │
     data available  │         OPEN                │◄── annual measure reset
-    patient eligible│   (priority scored,         │
-    not excluded    │    outreach triggered)       │
-                    │                             │
-                    └──────────┬──────────────────┘
-                               │ outreach sent /
-                               │ service ordered
-                    ┌──────────▼──────────────────┐
-                    │                             │
-                    │       IN_PROGRESS           │
-                    │   (service ordered or       │◄── result timeout (re-opens)
+    patient eligible│   (priority scored,         │◄─────────────────────────────┐
+    not excluded    │    outreach triggered)       │◄── exclusion revoked         │
+                    │                             │                              │
+                    └──────────┬──────────────────┘                              │
+                               │ outreach sent /                                 │
+                               │ service ordered                                 │
+                    ┌──────────▼──────────────────┐                              │
+                    │                             │                              │
+                    │       IN_PROGRESS           │── result timeout ────────────┘
+                    │   (service ordered or       │   (gap re-opens to OPEN)
                     │    appointment made)         │
                     │                             │
                     └───┬──────────┬──────────────┘
@@ -901,18 +958,18 @@ While the three systems are being co-developed, direct API calls have lower over
                         │          │
            ┌────────────▼──┐  ┌────▼────────────────┐
            │               │  │                     │
-           │    CLOSED     │  │  PATIENT_DECLINED   │
-           │  (terminal    │  │  (enter exclusion   │
-           │   for year)   │  │   review workflow)  │
-           │               │  │                     │
-           └───────────────┘  └──────┬──────────────┘
-                                     │ clinical
-                                     │ contraindication confirmed
+           │    CLOSED     │  │  PATIENT_DECLINED   │──► OPEN (non-medical decline;
+           │  (terminal    │  │  (enter exclusion   │        retry after hold period)
+           │   for year;   │  │   review workflow)  │
+           │   re-opens    │  │                     │
+           │   Jan 1)      │  └──────┬──────────────┘
+           │               │         │ clinical
+           └───────────────┘         │ contraindication confirmed
                               ┌──────▼──────────────┐
                               │                     │
-                              │     EXCLUDED        │
-                              │  (terminal,         │
-                              │   never outreach)   │
+                              │     EXCLUDED        │──► OPEN (if exclusion reason
+                              │  (terminal,         │        manually revoked via
+                              │   never outreach)   │        clinical review)
                               │                     │
                               └─────────────────────┘
 ```
@@ -953,24 +1010,24 @@ Gap Record Store [color: orange, icon: layers]
 Priority Scorer [color: orange, icon: trending-up]
 Provider Gap Summary [color: orange, icon: monitor]
 
-// ── OUTREACH ENGINE (Yellow) ──────────────────────────────────────
-Outreach Campaign Manager [color: yellow, icon: send]
-Channel Dispatcher [color: yellow, icon: git-branch]
-SMS Gateway [color: yellow, icon: message-square]
-Patient Portal Message [color: yellow, icon: mail]
-Automated Voice [color: yellow, icon: phone]
-Letter Service [color: yellow, icon: file-text]
-Outreach Response Handler [color: yellow, icon: inbox]
+// ── OUTREACH ENGINE (Orange) ──────────────────────────────────────
+Outreach Campaign Manager [color: orange, icon: send]
+Channel Dispatcher [color: orange, icon: git-branch]
+SMS Gateway [color: orange, icon: message-square]
+Patient Portal Message [color: orange, icon: mail]
+Automated Voice [color: orange, icon: phone]
+Letter Service [color: orange, icon: file-text]
+Outreach Response Handler [color: orange, icon: inbox]
 
-// ── SCHEDULING (Yellow) ───────────────────────────────────────────
-Appointment Request Service [color: yellow, icon: calendar]
-No Show Handler [color: yellow, icon: alert-circle]
+// ── SCHEDULING (Orange) ───────────────────────────────────────────
+Appointment Request Service [color: orange, icon: calendar]
+No Show Handler [color: orange, icon: alert-circle]
 
-// ── CLOSURE CONFIRMATION (Cyan) ───────────────────────────────────
-Gap Evidence Monitor [color: cyan, icon: eye]
-Pending Result Tracker [color: cyan, icon: clock]
-Provider Attestation [color: cyan, icon: user-check]
-Manual Exclusion Registry [color: cyan, icon: slash]
+// ── CLOSURE CONFIRMATION (Teal) ───────────────────────────────────
+Gap Evidence Monitor [color: teal, icon: eye]
+Pending Result Tracker [color: teal, icon: clock]
+Provider Attestation [color: teal, icon: user-check]
+Manual Exclusion Registry [color: teal, icon: slash]
 
 // ── PLATFORM INPUTS (Teal) ────────────────────────────────────────
 Note Signed Event [color: teal, icon: file-check]
@@ -990,106 +1047,110 @@ Pending Result Timeout [color: red, icon: alert-triangle]
 
 // ══ RELATIONSHIPS ═════════════════════════════════════════════════
 
-// DATA SOURCES → PATIENT IDENTITY
-EHR Data Source > Patient Identity Resolution
-Payer Claims Feed > Patient Identity Resolution
-State IIS Registry > Patient Identity Resolution
-HIE Connector > Patient Identity Resolution
-Lab Results Gateway > Patient Identity Resolution
+// DATA SOURCES → PATIENT IDENTITY [blue]
+EHR Data Source > Patient Identity Resolution [color: blue]
+Payer Claims Feed > Patient Identity Resolution [color: blue]
+State IIS Registry > Patient Identity Resolution [color: blue]
+HIE Connector > Patient Identity Resolution [color: blue]
+Lab Results Gateway > Patient Identity Resolution [color: blue]
 
 // PATIENT IDENTITY → PROFILE (matched) or STAGING (unmatched)
-Patient Identity Resolution > Longitudinal Patient Profile: matched
-Patient Identity Resolution > Data Staging Queue: unmatched pending review [color: red, style: dashed]
+Patient Identity Resolution > Longitudinal Patient Profile: matched [color: green]
+Patient Identity Resolution > Data Staging Queue: unmatched — pending review [color: red, style: dashed]
 Data Staging Queue > Patient Identity Resolution: retry after human review [color: red, style: dashed]
 
-// PROFILE → MEASURE ENGINE
-Longitudinal Patient Profile > Denominator Evaluator
+// PROFILE → MEASURE ENGINE [purple]
+Longitudinal Patient Profile > Denominator Evaluator [color: purple]
 
-// MEASURE ENGINE internal flow (sequential phases)
-Denominator Evaluator > Exclusion Evaluator: eligible patients only
-Exclusion Evaluator > Numerator Evaluator: non-excluded patients
+// MEASURE ENGINE internal flow (sequential phases) [purple]
+Denominator Evaluator > Exclusion Evaluator: eligible patients only [color: purple]
+Exclusion Evaluator > Numerator Evaluator: non-excluded patients [color: purple]
+Exclusion Evaluator > Gap Record Store: patient excluded — stop here [color: purple, style: dashed]
 
-// MEASURE SPEC provides criteria to all three phases
-Measure Spec Store > Denominator Evaluator
-Measure Spec Store > Exclusion Evaluator
-Measure Spec Store > Numerator Evaluator
+// MEASURE SPEC → all three phases [purple]
+Measure Spec Store > Denominator Evaluator [color: purple]
+Measure Spec Store > Exclusion Evaluator [color: purple]
+Measure Spec Store > Numerator Evaluator [color: purple]
 
-// NUMERATOR EVALUATOR → GAP RECORD STORE
-Numerator Evaluator > Gap Record Store: open or closed gap
+// NUMERATOR EVALUATOR → GAP RECORD STORE [purple]
+Numerator Evaluator > Gap Record Store: open or closed gap [color: purple]
 
-// GAP RECORD → PRIORITIZATION AND PROVIDER SUMMARY
-Gap Record Store > Priority Scorer
-Gap Record Store > Provider Gap Summary: pre-encounter display
-VBC Financial Report > Priority Scorer: financial weighting
+// GAP RECORD → PRIORITIZATION AND PROVIDER SUMMARY [orange]
+Gap Record Store > Priority Scorer [color: orange]
+Gap Record Store > Provider Gap Summary: pre-encounter display [color: orange]
+VBC Financial Report > Priority Scorer: financial weighting [color: orange, style: dashed]
 
-// PROVIDER SUMMARY → Medical Scribe (external)
-Provider Gap Summary > Note Signed Event: provider addresses gap during visit [color: teal, style: dashed]
+// PROVIDER SUMMARY is a TERMINAL OUTPUT to Medical Scribe UI via GapSummaryAPI (pull API).
+// Note Signed Event flows the OTHER direction — Medical Scribe publishes it → Care Gap receives it below.
 
-// PRIORITY SCORER → OUTREACH CAMPAIGN
-Priority Scorer > Outreach Campaign Manager
+// PRIORITY SCORER → OUTREACH CAMPAIGN [orange]
+Priority Scorer > Outreach Campaign Manager [color: orange]
 
-// OUTREACH CAMPAIGN → CHANNELS
-Outreach Campaign Manager > Channel Dispatcher
-Channel Dispatcher > SMS Gateway
-Channel Dispatcher > Patient Portal Message
-Channel Dispatcher > Automated Voice
-Channel Dispatcher > Letter Service
+// OUTREACH CAMPAIGN → CHANNELS [orange]
+Outreach Campaign Manager > Channel Dispatcher [color: orange]
+Channel Dispatcher > SMS Gateway [color: orange]
+Channel Dispatcher > Patient Portal Message [color: orange]
+Channel Dispatcher > Automated Voice [color: orange]
+Channel Dispatcher > Letter Service [color: orange]
 
-// ALL CHANNELS → RESPONSE HANDLER
-SMS Gateway > Outreach Response Handler
-Patient Portal Message > Outreach Response Handler
-Automated Voice > Outreach Response Handler
-Letter Service > Outreach Response Handler
+// ALL CHANNELS → RESPONSE HANDLER [orange]
+SMS Gateway > Outreach Response Handler [color: orange]
+Patient Portal Message > Outreach Response Handler [color: orange]
+Automated Voice > Outreach Response Handler [color: orange]
+Letter Service > Outreach Response Handler [color: orange]
 
 // RESPONSE HANDLER BRANCHES
-Outreach Response Handler > Appointment Request Service: patient responds
+Outreach Response Handler > Appointment Request Service: patient responds [color: orange]
 Outreach Response Handler > Patient Declined: patient declines [color: red, style: dashed]
-Outreach Response Handler > Outreach Campaign Manager: no response — next step [color: yellow, style: dashed]
+Outreach Response Handler > Outreach Campaign Manager: no response — retry next step [color: orange, style: dashed]
 
-// OUTREACH EXHAUSTED PATH
-Outreach Campaign Manager > Outreach Exhausted: all steps attempted no response [color: red, style: dashed]
+// OUTREACH EXHAUSTED PATH [red]
+Outreach Campaign Manager > Outreach Exhausted: all steps attempted — no response [color: red, style: dashed]
 Outreach Exhausted > Manual Review Queue: care coordinator follow-up [color: red, style: dashed]
 
-// PATIENT DECLINED PATH
+// PATIENT DECLINED PATH [red]
 Patient Declined > Manual Exclusion Registry: clinical review [color: red, style: dashed]
-Manual Exclusion Registry > Exclusion Evaluator: re-evaluate with new exclusion [color: red, style: dashed]
+Manual Exclusion Registry > Gap Record Store: confirmed exclusion applied [color: red, style: dashed]
 
-// SCHEDULING
-Appointment Request Service > Gap Evidence Monitor: appointment completed
+// SCHEDULING [orange / red]
+Appointment Request Service > Gap Evidence Monitor: appointment completed [color: teal]
 Appointment Request Service > No Show Handler: patient no-show [color: red, style: dashed]
-No Show Handler > Outreach Campaign Manager: reactivate campaign after 7 days [color: yellow, style: dashed]
+No Show Handler > Outreach Campaign Manager: reactivate after 7 days [color: orange, style: dashed]
+No Show Handler > Manual Review Queue: 2nd no-show — escalate to care coordinator [color: red, style: dashed]
 
-// PLATFORM EVENTS → CLOSURE
-Note Signed Event > Gap Evidence Monitor
-Claim Paid Event > Gap Evidence Monitor
+// PLATFORM EVENTS → CLOSURE [teal]
+Note Signed Event > Gap Evidence Monitor [color: teal]
+Claim Paid Event > Gap Evidence Monitor [color: teal]
 
-// CLOSURE PATHS
-Gap Evidence Monitor > Numerator Evaluator: evidence received — re-evaluate
-Gap Evidence Monitor > Pending Result Tracker: service ordered result pending
-Provider Attestation > Gap Evidence Monitor: manual attestation submitted
+// CLOSURE PATHS [teal]
+Gap Evidence Monitor > Numerator Evaluator: evidence received — re-evaluate [color: teal]
+Gap Evidence Monitor > Pending Result Tracker: service ordered — result pending [color: teal]
+Provider Attestation > Gap Evidence Monitor: manual attestation submitted [color: teal]
 
-// PENDING RESULT TIMEOUT
+// PENDING RESULT TIMEOUT [red]
 Pending Result Tracker > Pending Result Timeout: result not received within TAT [color: red, style: dashed]
 Pending Result Timeout > Gap Record Store: reopen gap [color: red, style: dashed]
 Pending Result Timeout > Manual Review Queue: notify provider [color: red, style: dashed]
 
-// REPORTING
-Gap Record Store > Quality Reporting Engine
-Quality Reporting Engine > HEDIS Submission
-Quality Reporting Engine > Population Dashboard
-Quality Reporting Engine > VBC Financial Report
+// REPORTING [teal]
+Gap Record Store > Quality Reporting Engine [color: teal]
+Quality Reporting Engine > HEDIS Submission [color: teal]
+Quality Reporting Engine > Population Dashboard [color: teal]
+Quality Reporting Engine > VBC Financial Report [color: teal]
+
+// MANUAL REVIEW QUEUE OUTGOING — care coordinator takes action [orange / teal]
+Manual Review Queue > Outreach Campaign Manager: coordinator places personal outreach call [color: orange, style: dashed]
+Manual Review Queue > Provider Attestation: coordinator requests service attestation [color: teal, style: dashed]
 
 legend {
-  [connection: ">", color: black, label: "Primary process flow"]
-  [connection: ">", color: red, label: "Error, failure or edge case path"]
-  [connection: ">", color: teal, label: "Platform integration (Medical Scribe / Claim Scrubbing)"]
-  [connection: ">", color: yellow, label: "Outreach loop or retry"]
+  [connection: ">", color: blue, label: "Data source feed"]
+  [connection: ">", color: green, label: "Identity resolution — matched"]
   [connection: ">", color: purple, label: "Measure evaluation flow"]
-  [connection: ">", color: orange, label: "Gap management and prioritization"]
-  [connection: ">", color: cyan, label: "Closure confirmation flow"]
+  [connection: ">", color: orange, label: "Gap management, prioritization and outreach"]
+  [connection: ">", color: teal, label: "Closure confirmation and platform events"]
+  [connection: ">", color: red, label: "Error, failure or edge case path"]
   [connection: ">", style: dashed, color: red, label: "Error fallback or edge case"]
-  [connection: ">", style: dashed, color: yellow, label: "Loop or retry within outreach"]
-  [connection: ">", style: dashed, color: teal, label: "Cross-system platform event"]
+  [connection: ">", style: dashed, color: orange, label: "Outreach retry or loop"]
   [shape: oval, label: "Start / End state"]
   [shape: rectangle, label: "Process or system component"]
 }
