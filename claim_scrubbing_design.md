@@ -50,21 +50,21 @@ The core challenge: **catch every preventable denial before the claim is transmi
 ┌─────────────────────────────────────────────────────────┐
 │  CLAIM                                                  │
 │                                                         │
-│  Patient:   John Smith, DOB 1965-03-12, Ins ID XY123   │
-│  Provider:  Dr. Martinez, NPI 1234567890               │
-│  Payer:     Blue Cross Blue Shield Illinois            │
+│  Patient:   John Smith, DOB 1965-03-12, Ins ID XY123    │
+│  Provider:  Dr. Martinez, NPI 1234567890                │
+│  Payer:     Blue Cross Blue Shield Illinois             │
 │  DOS:       2026-03-14                                  │
-│  Place:     Office (POS 11)                            │
+│  Place:     Office (POS 11)                             │
 │                                                         │
 │  Diagnoses (ICD-10):                                    │
 │    R09.1  Pleurisy                                      │
 │    I10    Essential hypertension                        │
 │                                                         │
 │  Procedures (CPT):                                      │
-│    99214  Office visit, established, moderate MDM      │
-│    93000  EKG with interpretation                      │
+│    99214  Office visit, established, moderate MDM       │
+│    93000  EKG with interpretation                       │
 │                                                         │
-│  Linked note:  [Progress note from Medical Scribe]     │
+│  Linked note:  [Progress note from Medical Scribe]      │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -77,7 +77,7 @@ The claim is a structured form (CMS-1500 / 837P EDI file), but its validity depe
 ```
 ┌───────────────────────────────────────────────────────────────────┐
 │  INPUT SOURCES                                                    │
-│  EHR (ICD-10 + CPT + Note)  ──►  Claim Builder  ──►  Raw Claim  │
+│  EHR (ICD-10 + CPT + Note)  ──►  Claim Builder  ──►  Raw Claim    │
 └─────────────────────────────────────────┬─────────────────────────┘
                                           │
                           ┌───────────────▼──────────────────┐
@@ -88,39 +88,39 @@ The claim is a structured form (CMS-1500 / 837P EDI file), but its validity depe
                                           │
           ┌───────────────────────────────▼──────────────────────────┐
           │               SCRUBBING ENGINE (5 parallel layers)       │
-          │                                                           │
+          │                                                          │
           │  Layer 1          Layer 2          Layer 3               │
           │  Structural       Clinical Rules   Payer-Specific        │
           │  Validation       (CCI/NCCI/LCD)   Rules                 │
-          │                                                           │
-          │  Layer 4          Layer 5                                 │
-          │  Documentation    ML Denial                               │
-          │  Audit (LLM)      Predictor                               │
+          │                                                          │
+          │  Layer 4          Layer 5                                │
+          │  Documentation    ML Denial                              │
+          │  Audit (LLM)      Predictor                              │
           └───────────────────────────────┬──────────────────────────┘
                                           │
                           ┌───────────────▼──────────────────┐
-                          │    ISSUE AGGREGATOR & PRIORITIZER │
-                          │  BLOCKING → WARNING → INFO        │
+                          │    ISSUE AGGREGATOR & PRIORITIZER│
+                          │  BLOCKING → WARNING → INFO       │
                           └───────────────┬──────────────────┘
                                           │
                 ┌─────────────────────────▼──────────────────────┐
-                │          REMEDIATION INTERFACE                  │
-                │  Billing team reviews issues + suggested fixes  │
-                │  Auto-fix for deterministic errors              │
-                │  Manual queue for judgment calls                │
+                │          REMEDIATION INTERFACE                 │
+                │  Billing team reviews issues + suggested fixes │
+                │  Auto-fix for deterministic errors             │
+                │  Manual queue for judgment calls               │
                 └─────────────────────────┬──────────────────────┘
                                           │
                           ┌───────────────▼──────────────────┐
-                          │       CLEAN CLAIM SUBMISSION      │
-                          │  837P EDI → Clearinghouse →       │
-                          │  Payer                            │
+                          │       CLEAN CLAIM SUBMISSION     │
+                          │  837P EDI → Clearinghouse →      │
+                          │  Payer                           │
                           └───────────────┬──────────────────┘
                                           │
                           ┌───────────────▼──────────────────┐
-                          │   PAYER RESPONSE & FEEDBACK LOOP  │
-                          │  Paid / Denied / Pending          │
-                          │  Denials → retrain ML model       │
-                          │  New patterns → update rules      │
+                          │   PAYER RESPONSE & FEEDBACK LOOP │
+                          │  Paid / Denied / Pending         │
+                          │  Denials → retrain ML model      │
+                          │  New patterns → update rules     │
                           └──────────────────────────────────┘
 ```
 
