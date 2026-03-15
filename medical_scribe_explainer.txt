@@ -1,0 +1,902 @@
+================================================================================
+  AI MEDICAL SCRIBE — COMPLETE FLOW EXPLAINED
+  Independence OS | Plain-English Walkthrough
+  For: Anyone reading this for the first time
+================================================================================
+
+This document walks through the entire Medical Scribe system from start to
+finish using ONE real example all the way through. Every stage is explained
+in plain English first, then technically. By the end, you should be able to
+look at the flowchart and narrate every node and arrow yourself.
+
+--------------------------------------------------------------------------------
+THE RUNNING EXAMPLE (used throughout this entire document)
+--------------------------------------------------------------------------------
+
+  DOCTOR:   Dr. Sarah Martinez, primary care physician
+  PATIENT:  John Smith, 61-year-old male
+  VISIT:    Monday afternoon, March 14, 2026
+  REASON:   John has had sharp chest pain for 3 days
+
+We will follow this one visit from the moment the recording starts to the
+moment the note is locked in the EHR and the bill is sent to insurance.
+
+================================================================================
+SECTION 0 — WHY DOES THIS SYSTEM EXIST?
+================================================================================
+
+After every patient visit, the doctor must write a "progress note." This is
+not just a summary — it is a legal medical record AND the document that
+determines how much the clinic gets paid.
+
+A typical progress note has 13+ sections:
+  - Chief Complaint (why the patient came in)
+  - HPI (the full story of the current problem)
+  - Review of Systems (head-to-toe question checklist)
+  - Physical Examination findings
+  - Assessment (what the doctor thinks is wrong)
+  - Plan (what will be done about it)
+  - Past medical history, surgical history, family history, social history
+  - Allergies, medications, billing codes
+
+Writing all of this takes a doctor 15+ minutes PER PATIENT.
+A doctor seeing 20 patients a day = 5 hours of paperwork every night.
+Many doctors finish notes at 10pm or later. Some take days.
+
+This is the number 1 cause of physician burnout.
+It also delays billing — the clinic can't get paid until the note is done.
+
+THE GOAL: Record the conversation → automatically write the note → doctor
+spends 2-3 minutes reviewing and approving it instead of 15 minutes writing.
+
+================================================================================
+SECTION 1 — STAGE 1: CAPTURE
+  [Diagram nodes: Microphone → Consent Gate → Local Edge Agent →
+   Audio Intake and Validation]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Dr. Martinez walks into the exam room. She presses a button on a small
+tablet, which says: "Recording will begin. Do you consent?" John nods and
+says yes. Dr. Martinez confirms. Recording starts.
+
+A small device in the clinic room — basically a smart microphone — picks
+up everything that is said for the next 15 minutes. The entire conversation
+is captured as an audio file.
+
+BUT — before that audio goes anywhere, four things happen right there in
+the room:
+
+  1. NOISE IS CLEANED UP
+     The device removes background noise — the AC humming, papers rustling,
+     the door closing. Think of it like noise-cancelling headphones, but
+     for the recording.
+
+  2. SILENCE IS STRIPPED
+     When Dr. Martinez steps out to check results and John sits quietly,
+     those silent gaps are removed. This shrinks the file size by ~60% and
+     makes everything downstream faster.
+
+  3. THE AUDIO IS ENCRYPTED
+     Before the audio travels anywhere over the internet, it is locked with
+     AES-256 encryption. This is the same standard banks use. Nobody can
+     read it without the key. This is critical because audio is extremely
+     sensitive — it contains someone's voice, their medical problems, their
+     personal details.
+
+  4. IT IS SAVED LOCALLY FIRST
+     If the internet connection drops, the audio is saved to the device.
+     It will upload when the connection comes back. The recording never
+     gets lost.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+The LOCAL EDGE AGENT is a lightweight program running on a Mac mini or
+tablet in the clinic. It runs:
+  - RNNoise (real-time noise suppression library) or WebRTC for noise suppression
+  - Voice Activity Detection (VAD) — silence detection and removal
+  - Audio chunking into 4-second segments with 1-second overlaps
+    (overlap prevents a word being cut in half between chunks)
+  - AES-256 encryption with a per-clinic key from AWS KMS
+  - An offline queue that flushes to S3 when network restores
+
+AUDIO INTAKE AND VALIDATION receives the encrypted audio and does:
+  - Format check: accepts WAV, MP3, M4A, FLAC, OGG
+  - Normalizes everything to 16kHz mono PCM (the format ASR(Automatic Speech Recognition) models expect)
+  - Duration check: rejects anything under 60 seconds (not a real visit)
+  - Language detection: flags non-English for human review
+  - Clipping detection: warns if audio is too loud and distorted
+
+  IF AUDIO IS INVALID → goes to Alert Doctor → Dictation Fallback
+  (Doctor speaks directly into mic, skips ASR/Diarization, jumps straight
+  to Transcript Post-Processing. We know it's all doctor speech so no
+  need to separate speakers.)
+
+  IF AUDIO IS VALID → continues to Stage 2
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Microphone (oval = start point)
+      ↓
+  Consent Gate
+      ↓
+  Local Edge Agent [blue box with sub-components inside]
+      ↓
+  Audio Intake and Validation
+      ↓ (red dashed line) → Invalid Audio → Alert Doctor → Dictation Fallback
+                                           → re-enters at Transcript Post-Processing
+      ↓ (solid line, "valid audio")
+  [Stage 2]
+
+================================================================================
+SECTION 2 — STAGE 2: TRANSCRIPTION
+  [Diagram nodes: Speaker Diarization + Medical ASR Engine (parallel) →
+   Transcript Post-Processing → Clean Labelled Transcript]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Now the system does two jobs AT THE SAME TIME on the audio:
+
+JOB 1: FIGURE OUT WHO IS SPEAKING
+  The system listens to the voices and labels every sentence:
+  - "So what brings you in today?" → DOCTOR
+  - "I've had chest pain for three days" → PATIENT
+  - "Any fever?" → DOCTOR
+  - "No fever" → PATIENT
+
+  This is important because the same words mean different things depending
+  on who said them. When the PATIENT says "I've had chest pain for 3 days,"
+  that goes into the Chief Complaint. When the DOCTOR says "Breath sounds
+  are clear," that goes into the Physical Examination.
+
+  HOW DOES IT KNOW WHOSE VOICE IS WHOSE?
+  When Dr. Martinez first joined the clinic, she recorded 30 seconds of
+  herself speaking. The system stored her "voice fingerprint." Every time
+  a recording comes in, it matches voices to that fingerprint. Dr. Martinez
+  = known voice. John = the other voice.
+
+JOB 2: CONVERT SPEECH TO TEXT
+  The audio is run through a speech-to-text model. But not a regular one —
+  this is a MEDICAL speech-to-text model, trained on doctor-patient
+  conversations. It knows words like "metoprolol," "pleuritis,"
+  "atrioventricular" — words that regular speech-to-text often gets wrong.
+
+  After both jobs are done, the transcription is CLEANED UP:
+  - Medical spelling is corrected ("metropolol" → "metoprolol")
+  - Filler words are removed ("um," "uh," "you know")
+  - Sentences are properly separated
+  - A safety check removes any patient name/ID that accidentally leaked
+
+THE RESULT: A clean, labelled transcript that looks like this:
+
+  [0:00-0:03] DOCTOR: "So what brings you in today?"
+  [0:04-0:12] PATIENT: "I've had this chest pain for about three days now,
+                         it's worse when I breathe in."
+  [0:13-0:15] DOCTOR: "Any fever or cough?"
+  [0:16-0:18] PATIENT: "No fever, no cough."
+  [0:19-0:25] DOCTOR: "Any family history of heart disease?"
+  [0:26-0:32] PATIENT: "My father had a heart attack at 60."
+  [1:45-2:10] DOCTOR: "I'm going to listen to your lungs now.
+                        Breath sounds clear bilaterally."
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+SPEAKER DIARIZATION uses pyannote.audio — an open-source speaker
+diarization library. It uses a pre-enrolled voice embedding for Dr.
+Martinez (stored at onboarding) and assigns every audio segment to either
+DOCTOR or PATIENT based on cosine similarity of voice embeddings.
+
+MEDICAL ASR ENGINE uses OpenAI Whisper large-v3 fine-tuned on medical
+speech. Two boosts are applied:
+  - RxNorm dictionary: 50,000+ drug names injected into the decoder beam
+    search (improves medication recognition from ~71% to ~94%)
+  - SNOMED CT terms: anatomy and procedure terminology
+
+Both run IN PARALLEL on the same audio chunks.
+
+TRANSCRIPT POST-PROCESSING runs five steps in sequence:
+  1. Medical spell correction: Levenshtein distance + medical ontology
+  2. Filler word removal: regex strip on PATIENT speech only
+     (doctor speech is retained exactly — may contain clinical phrasing)
+  3. Sentence boundary detection: fine-tuned BERT for punctuation restoration
+  4. De-ID check: NER pass to catch any PII that leaked into transcript
+  5. Conversation segmentation: groups turns into semantic topic blocks
+
+OUTPUT: Clean Labelled Transcript — a JSON array of segments with
+speaker, start/end timestamps, cleaned text, and confidence score.
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Audio Intake and Validation
+      ↓ (two parallel arrows)
+  Speaker Diarization ─────────────────────┐
+  Medical ASR Engine ──────────────────────┤
+                                           ↓
+  [both feed into] Transcript Post-Processing
+                                           ↓
+  Clean Labelled Transcript
+
+================================================================================
+SECTION 3 — STAGE 3: CLINICAL EXTRACTION
+  [Diagram nodes: Entity Extraction → Section Population (13 parallel) →
+   Consistency Check]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+This is the BRAIN of the system.
+
+The clean transcript is just a conversation. The progress note needs to be
+a structured medical document with 13+ specific sections, written in
+clinical language.
+
+The AI (Claude) does this in THREE PASSES:
+
+---
+
+PASS 1: READ EVERYTHING AND PULL OUT ALL THE FACTS
+
+  The AI reads the entire transcript once and makes a list of every
+  clinical fact it finds. Like a student reading a case study and
+  highlighting important points:
+
+    Facts extracted:
+    - John has had chest pain for 3 days
+    - The pain is sharp and gets worse when he breathes in (pleuritic)
+    - Severity: 7 out of 10
+    - No fever, no cough, no blood in sputum
+    - His blood pressure today is 142/88
+    - He takes lisinopril 10mg daily for blood pressure
+    - He is allergic to penicillin (causes a rash)
+    - His father had a heart attack at age 60
+    - Dr. Martinez listened to his lungs — they are clear
+    - Dr. Martinez ordered an EKG and a D-dimer blood test
+
+---
+
+PASS 2: FILL IN EACH OF THE 13 SECTIONS
+
+  Now, using those extracted facts, the AI fills in each section of the
+  note. Each section gets its own focused task. 13 sections run at the
+  SAME TIME to save time:
+
+  CHIEF COMPLAINT section gets:
+    → The AI writes: "Chest pain for 3 days."
+
+  HISTORY OF PRESENT ILLNESS section gets:
+    → The AI writes: "John Smith is a 61-year-old male with a history of
+      hypertension who presents with a 3-day history of sharp, left-sided
+      chest pain rated 7/10, worsening with inspiration. He denies fever,
+      productive cough, or hemoptysis..."
+
+  REVIEW OF SYSTEMS section gets:
+    → The AI lists every body system Dr. Martinez asked about:
+      "Cardiovascular: chest pain present. Respiratory: shortness of breath
+      on exertion. Gastrointestinal: denies nausea/vomiting..."
+
+  FAMILY HISTORY section gets:
+    → "Father: myocardial infarction at age 60."
+
+  PHYSICAL EXAMINATION section gets:
+    → "Auscultation: breath sounds clear bilaterally..."
+
+  And so on for all 13 sections.
+
+---
+
+PASS 3: CHECK THAT EVERYTHING IS CONSISTENT
+
+  The AI reads all 13 sections together and checks:
+  - Does the Plan address every problem listed in the Assessment?
+  - Do the billing codes match what is documented?
+  - Is anything mentioned in the HPI (History of Present Illness) missing from Review of Systems?
+  - Did the AI accidentally invent something not in the transcript?
+    (This is called "hallucination" — a major risk with AI systems)
+
+  HALLUCINATION GUARD (very important):
+  Every single sentence in the generated note must be traced back to a
+  specific timestamp in the original transcript. If the AI wrote something
+  that has no matching line in the transcript — it gets flagged. The doctor
+  can click any sentence and hear the exact audio moment that supports it.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+This uses Claude claude-sonnet-4-6 as the LLM orchestrator.
+
+PASS 1 (Entity Extraction): Single prompt over the full transcript.
+  Extracts structured JSON:
+  {
+    "symptoms": [{"text": "chest pain", "duration": "3 days",
+                  "character": "pleuritic", "severity": "7/10"}],
+    "medications": [{"name": "lisinopril", "dose": "10mg", "freq": "daily"}],
+    "vitals": {"BP": "142/88", "HR": "96", "SpO2": "97%"},
+    "allergies": [{"allergen": "penicillin", "reaction": "rash"}]
+  }
+
+PASS 2 (Section Population): 13 parallel Claude API calls, one per section.
+  Each call receives:
+  - The relevant extracted entities from Pass 1
+  - The raw transcript segments classified to that section
+  - Section-specific requirements (e.g. HPI must include: onset, duration,
+    character, severity, location, radiation, modifying factors,
+    associated symptoms)
+  - A few-shot example of a well-written section
+
+PASS 3 (Consistency Check): Single prompt with all 13 section drafts.
+  Verifies cross-section consistency and grounding.
+
+CONFIDENCE SCORING: Every extracted claim gets a score:
+  0.9+  = explicitly stated → no flag
+  0.7-0.9 = inferred with high confidence → subtle highlight
+  0.5-0.7 = ambiguous → yellow flag, doctor must review
+  < 0.5  = possibly hallucinated → red flag, mandatory review
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Clean Labelled Transcript
+      ↓
+  Entity Extraction [purple]
+      ↓
+  Section Population [purple — 13 parallel boxes inside]
+      ↓
+  Consistency Check [purple]
+      ↓
+  [Stage 4]
+
+================================================================================
+SECTION 4 — STAGE 4: CODING ENGINE
+  [Diagram nodes: ICD-10 Suggester + CPT Suggester (parallel) →
+   Progress Note Assembler]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Medical billing uses two types of codes:
+
+  ICD-10 CODES = "What is wrong with the patient?" (diagnosis codes)
+    Example: I10 = hypertension, R09.1 = pleurisy
+
+  CPT CODES = "What did the doctor do during the visit?" (procedure codes)
+    Example: 99214 = moderate-complexity office visit, 93000 = EKG
+
+These codes go on the insurance claim. They determine how much the clinic
+gets paid. Wrong codes = claim denied = clinic doesn't get paid.
+
+ICD-10 alone has 70,000+ codes. The system cannot guess randomly.
+
+---
+
+HOW ICD-10 CODES ARE PICKED (two-step process):
+
+  STEP 1: SEARCH (fast)
+    Think of this like a Google search over 70,000 codes.
+    The AI takes the diagnosis text ("pleurisy confirmed on exam") and
+    searches for the 50 most similar ICD-10 codes in a database.
+    This is done using vector embeddings — turning the text into numbers
+    and finding the closest numerical matches.
+
+  STEP 2: PICK THE BEST ONE (smart)
+    The AI reads the top 50 candidates and the actual clinical notes, then
+    picks the MOST SPECIFIC applicable code.
+
+    WHY SPECIFICITY MATTERS:
+    "Chest pain, unspecified" = R07.9 → lower reimbursement, audit risk
+    "Pleurodynia" = R07.81 → precise, supported by documentation ✓
+
+---
+
+HOW CPT CODES ARE PICKED:
+
+  The most important CPT code is the VISIT LEVEL (called E&M code).
+  This is the number that represents how complex the visit was:
+
+    99213 = Simple visit  → ~$100 reimbursement
+    99214 = Medium visit  → ~$150 reimbursement  (most common)
+    99215 = Complex visit → ~$210 reimbursement
+
+  The system scores the visit based on three things:
+    1. How many problems did the doctor address?
+    2. How much data did the doctor review? (labs, imaging, records)
+    3. How risky are the treatment decisions?
+
+  Score these three → get the E&M level.
+
+  Other CPT codes come from the Plan section:
+    "I'm ordering an EKG" → CPT 93000
+
+---
+
+THE RESULT: Both codes are generated, with confidence scores, and both
+feed into the Progress Note Assembler which stitches the complete note
+together: 13 sections + diagnosis codes + procedure codes.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+ICD-10 SUGGESTER:
+  Stage 1: BioBERT (medical embeddings model) embeds the Assessment text.
+  Cosine similarity search over a pgvector index of 70,000+ ICD-10 codes.
+  Body system pre-filter reduces search space (e.g. "chest" → I00-I99
+  circulatory codes only).
+  Returns top-50 candidates.
+
+  Stage 2: Claude receives top-50 candidates + assessment text and
+  selects the most specific code with justification. Walks the ICD-10
+  hierarchy tree and stops at the deepest level the documentation supports.
+
+CPT SUGGESTER:
+  E&M level: Scores MDM (Medical Decision Making) on three axes
+  (problems, data, risk) → maps to 99213/99214/99215.
+  Procedure codes: Pattern match from Plan section text.
+
+COMPLIANCE GUARDS:
+  - Upcoding prevention: LLM score < billed code → BLOCKING flag
+  - Bundling check: CCI edits (code pairs that can't be billed together)
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Consistency Check
+      ↓ (two parallel arrows)
+  ICD-10 Suggester ────────────────────────────┐
+  CPT Suggester ───────────────────────────────┤
+                                               ↓
+  Progress Note Assembler
+      ↓
+  Draft Note
+
+================================================================================
+SECTION 5 — STAGE 5: DOCTOR REVIEW
+  [Diagram nodes: Draft Note → Doctor Review Interface →
+   Flagged Items Unresolved (loop back) → Doctor Signs]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+About 2-3 minutes after the visit ends, Dr. Martinez picks up her tablet.
+The note is already written. She is not writing — she is REVIEWING.
+
+The screen shows her 13 sections, already filled out. Green checkmarks
+on the sections that look good. Yellow warning flags on sections where
+the AI was less certain.
+
+DR. MARTINEZ'S REVIEW EXPERIENCE:
+
+  She taps "HPI" — reads the paragraph. Looks right. Taps "Accept."
+  She taps "Review of Systems" — there is a yellow flag on one line.
+    The AI wrote: "Patient denies hemoptysis" (coughing up blood)
+    The AI is 68% confident John said this.
+    Dr. Martinez clicks the sentence — the tablet plays a 4-second audio
+    clip of John saying "No, no blood."
+    She taps "Accept as-is."
+
+  She taps "Plan" — there is a red flag.
+    The AI wrote that she ordered a CT scan.
+    But she never ordered a CT scan — she only ordered a D-dimer and EKG.
+    This is a hallucination. The AI made something up.
+    She taps "Delete" — the CT scan line is removed.
+
+  She looks at the billing codes:
+    R09.1 (Pleurisy) — 0.91 confidence. She taps "Accept."
+    I10 (Hypertension) — 0.98 confidence. She taps "Accept."
+    99214 (Level 4 E&M) — 0.88 confidence. She reviews — looks right,
+    she had two problems to manage, reviewed data. She taps "Accept."
+
+  She taps "SIGN NOTE."
+
+  A confirmation appears: "2 flagged items were accepted without editing.
+  Continue?" She taps confirm.
+
+  The note is now SIGNED and LOCKED. Done in 2 minutes 47 seconds.
+
+---
+
+TWO RULES THAT CANNOT BE BROKEN:
+
+  1. FLAGGED ITEMS CANNOT BE SKIPPED.
+     The doctor must take an explicit action on every yellow/red flag.
+     There is no "ignore all" button. She must Accept, Edit, or Delete.
+     This is a legal and safety requirement.
+
+  2. BILLING CODES ALWAYS REQUIRE EXPLICIT ACCEPTANCE.
+     Even if the confidence is 0.99, the doctor must tap "Accept" on
+     each code. Codes are never silently included.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+DRAFT NOTE is displayed with confidence scores per sentence.
+Sentences below 0.70 confidence are visually flagged.
+Sentences below 0.50 confidence are hard-flagged (mandatory action).
+
+AUDIO LINKAGE: Every generated sentence stores source_segment_ids —
+pointers to the transcript segments that support it. The UI retrieves
+the audio clip for those timestamps on demand.
+
+LOOPBACK: If Flagged Items remain unresolved:
+  Flagged Items Unresolved → Doctor Review Interface (loop back)
+  The doctor cannot proceed to signing until all flags are resolved.
+
+SIGN & LOCK:
+  1. Immutable snapshot of note is created (stored in DB, never editable)
+  2. Doctor's private key signs the note (cryptographic signature)
+  3. Audit log is finalized
+  4. EHR (Electronic Health Record) push is triggered
+  5. Billing submission is queued
+  6. Note status → LOCKED
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Draft Note
+      ↓
+  Doctor Review Interface [yellow]
+      ↓ "Flags unresolved" → Flagged Items Unresolved [yellow]
+                                      ↓ "Loop back"
+      ← ←  ← ← ← ← ← ← ← ← ← ← ← ↙
+  Doctor Review Interface (returned to)
+      ↓ "All flags resolved"
+  Doctor Signs (oval = end state) [yellow]
+
+================================================================================
+SECTION 6 — STAGE 6: OUTPUT
+  [Diagram nodes: Signed Note → EHR Integration + Billing Submission →
+   Epic/Athena/Cerner + Insurance Claims]
+  [Error paths: EHR Dead Letter Queue, Billing Dead Letter Queue]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Once Dr. Martinez signs, two things happen simultaneously:
+
+1. THE NOTE GOES TO THE EHR
+   The electronic health record (the clinic's patient records system —
+   could be Epic, Athena, Cerner, etc.) receives the complete note.
+   John Smith's chart is updated. The next doctor who sees him will have
+   this full visit record.
+
+2. THE BILLING IS SUBMITTED
+   The ICD-10 and CPT codes go to the insurance company (Blue Cross Blue
+   Shield, Medicare, etc.) as a formal claim. The clinic will receive
+   reimbursement based on those codes.
+
+---
+
+WHAT IF SOMETHING FAILS?
+
+  If the EHR push fails (server down, network issue):
+    - The system retries automatically (3 attempts, with delays)
+    - If all 3 fail → goes to EHR Dead Letter Queue
+    - The admin gets an alert and can manually re-export
+
+  If billing submission fails:
+    - Same retry logic → Billing Dead Letter Queue
+    - Billing team is notified to resubmit manually
+
+  IMPORTANT: These failure paths are completely separate from the
+  Audio Error path earlier. An audio failure at the start of the pipeline
+  never reaches billing. Billing is only ever reached via a signed note.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+EHR INTEGRATION: Assembles a FHIR R4 bundle:
+  - DocumentReference resource (the note text)
+  - Condition resources (one per ICD-10 diagnosis)
+  - Procedure resources (one per CPT code)
+  - Encounter resource linking everything
+
+Connectors per EHR:
+  - Epic: SMART on FHIR + Epic FHIR APIs
+  - Athenahealth: REST API + webhooks
+  - Cerner: FHIR R4 API
+  - Fallback: CDA XML + PDF export
+
+BILLING SUBMISSION: 837P EDI transaction to clearinghouse
+(Availity or Change Healthcare), which routes to the correct payer.
+
+FAILURE HANDLING: Exponential backoff retry (1s, 4s, 16s).
+After 3 failures → dead-letter queue + admin alert.
+Note status remains SIGNED even if EHR/billing push fails — the
+legal record is preserved regardless.
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Doctor Signs
+      ↓
+  Signed Note [cyan]
+      ↓ (two parallel arrows)
+  EHR Integration ──────────────────────┐
+  Billing Submission ────────────────────┤
+      ↓                                 ↓
+  Epic / Athena / Cerner          Insurance Claims
+      ↓ (red dashed, after 3 retries)
+  EHR Dead Letter Queue
+  Billing Dead Letter Queue
+
+================================================================================
+SECTION 7 — THE ERROR PATH (What happens when audio fails)
+  [Diagram: Invalid Audio → Alert Doctor → Dictation Fallback →
+   re-enters at Transcript Post-Processing]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Suppose the microphone cable fell out mid-visit. Or there was so much
+background noise that only 40% of the words were recognizable. Or John
+spoke very quietly and the ASR got confused.
+
+WHAT HAPPENS:
+
+  Audio Intake and Validation detects the problem:
+    "Audio confidence is 38%. Too low to process reliably."
+
+  → ALERT DOCTOR: Dr. Martinez's tablet shows a notification:
+    "Recording quality insufficient. Please dictate the note manually."
+
+  → DICTATION FALLBACK: Dr. Martinez holds the tablet close and speaks:
+    "Chief complaint: chest pain 3 days. HPI: 61-year-old male, sharp
+    pleuritic chest pain, worse with inspiration, rated 7/10. No fever,
+    no cough. Assessment: pleuritis, hypertension. Plan: D-dimer, EKG,
+    ibuprofen 600mg TID, follow up in 4 weeks..."
+
+  This dictation goes straight to TRANSCRIPT POST-PROCESSING.
+  We skip Speaker Diarization (we know it's all the doctor speaking).
+  We skip the Medical ASR with noise handling (the mic is clean now).
+
+  The rest of the pipeline — extraction, coding, review — runs IDENTICALLY.
+
+------------------------------------------------------------------------
+KEY POINT FOR UNDERSTANDING THE DIAGRAM:
+------------------------------------------------------------------------
+
+The error path is a DEAD END that loops back INTO the pipeline.
+It NEVER connects to EHR or Billing.
+
+This is the most common mistake when reading the diagram — people see
+the red lines and wonder if failed audio somehow reaches billing.
+It cannot. The only way to reach billing is through:
+
+  Audio/Dictation → Transcript → Extraction → Coding → Draft Note
+  → Doctor Signs → Signed Note → Billing
+
+There is no shortcut. Billing requires a signed note. Period.
+
+================================================================================
+SECTION 8 — THE COMPLETE FLOW IN ONE STORY
+================================================================================
+
+Let's retell the entire John Smith visit as one continuous narrative,
+so you can trace it through the diagram without stopping.
+
+------------------------------------------------------------------------
+
+2:00 PM — Dr. Martinez and John Smith are in the exam room.
+Dr. Martinez taps "Start Recording." John says he consents.
+
+DIAGRAM: Microphone → Consent Gate → Local Edge Agent
+
+The device removes background noise, strips silence, encrypts the audio.
+The file is 14 minutes 23 seconds of clean, encrypted audio.
+
+DIAGRAM: Local Edge Agent → Audio Intake and Validation
+
+The system checks: valid format, duration > 60s, English, not clipped.
+Audio passes validation.
+
+DIAGRAM: Audio Intake and Validation → (valid audio) →
+         Speaker Diarization + Medical ASR Engine (parallel)
+
+Two jobs run at the same time:
+  Job 1: Voice fingerprints identify Dr. Martinez vs John.
+  Job 2: Whisper converts speech to text with medical vocabulary boost.
+
+The clean transcript arrives:
+  [DOCTOR] "What brings you in?"
+  [PATIENT] "Chest pain for 3 days, worse when I breathe in."
+  [DOCTOR] "Any fever?" [PATIENT] "No."
+  [DOCTOR] "Family history?" [PATIENT] "Dad had a heart attack at 60."
+  [DOCTOR] "Breath sounds clear bilaterally..."
+  ... (full conversation, timestamped, speaker-labelled)
+
+DIAGRAM: → Transcript Post-Processing → Clean Labelled Transcript
+
+Filler words removed. Medical terms spell-checked. Sentences segmented.
+
+2:01 PM — Transcript is ready. Three LLM passes begin.
+
+DIAGRAM: Clean Labelled Transcript → Entity Extraction
+
+Pass 1 extracts: chest pain (3 days, pleuritic, 7/10), BP 142/88,
+lisinopril 10mg, penicillin allergy, father MI at 60, clear lungs,
+EKG ordered, D-dimer ordered.
+
+DIAGRAM: Entity Extraction → Section Population (13 parallel)
+
+Pass 2 runs 13 simultaneous AI calls. Each fills one note section.
+Chief Complaint: written. HPI: written. ROS: written. Exam: written.
+Assessment: written. Plan: written. History sections: written.
+
+DIAGRAM: Section Population → Consistency Check
+
+Pass 3 checks everything is consistent. Hallucination check: every
+sentence verified against transcript timestamps. One issue found:
+"CT scan ordered" has no supporting timestamp → FLAGGED.
+
+DIAGRAM: Consistency Check → ICD-10 Suggester + CPT Suggester (parallel)
+
+ICD-10: BioBERT search → top 50 codes → Claude picks R09.1 (Pleurisy,
+0.91), I10 (Hypertension, 0.98).
+
+CPT: MDM scoring → 2 problems, ordered 2 tests, moderate risk →
+99214 (0.88). EKG ordered → CPT 93000 (0.95).
+
+DIAGRAM: → Progress Note Assembler → Draft Note
+
+2:03 PM — Draft note is complete and ready for Dr. Martinez.
+
+DIAGRAM: Draft Note → Doctor Review Interface
+
+Dr. Martinez opens the note. 11 sections have green checkmarks.
+2 sections have yellow flags (ROS: "denies hemoptysis" at 0.68 confidence,
+Plan: "CT scan ordered" hallucination at 0.31 confidence — red flag).
+
+She plays the audio clip for the "hemoptysis" sentence. John clearly said
+"no blood." She accepts.
+She deletes the CT scan line — hallucination confirmed.
+She accepts all 4 billing codes.
+
+DIAGRAM: Doctor Review Interface → (flags unresolved → loop back)
+         All flags resolved → Doctor Signs
+
+2:05:47 PM — Dr. Martinez taps SIGN. Confirmation modal. She confirms.
+
+DIAGRAM: Doctor Signs → Signed Note
+
+Note is locked. Immutable snapshot created. Audit log finalized.
+
+DIAGRAM: Signed Note → EHR Integration + Billing Submission (parallel)
+
+John's chart in Athenahealth is updated with the complete note.
+The 837P billing file is sent to BCBS Illinois.
+
+DIAGRAM: EHR Integration → Athena
+         Billing Submission → Insurance Claims
+
+Done. Total time from visit end to note signed: 5 minutes 47 seconds.
+Dr. Martinez can see her next patient.
+
+================================================================================
+SECTION 9 — THE TIMING (Why it fits in under 3 minutes)
+================================================================================
+
+The reason this is fast is because stages OVERLAP and run in PARALLEL.
+Here's what's happening second by second:
+
+  T+0s    Upload begins
+  T+0s    VAD + chunking runs DURING upload (not after)
+  T+15s   Diarization starts on FIRST 60 seconds of audio
+  T+15s   ASR starts SIMULTANEOUSLY with diarization
+  T+60s   First transcript segments available — extraction starts immediately
+  T+90s   LLM Pass 1 (entity extraction) starts on partial transcript
+  T+120s  Full transcript available
+  T+120s  LLM Pass 2 (13 sections, ALL parallel) starts
+  T+150s  Coding engine starts on Pass 2 output
+  T+170s  Draft note ready
+
+The doctor is seeing their NEXT patient during this 2:50. When they're
+ready, the note is waiting. Not 15 minutes of writing. Not 3 minutes of
+waiting. 2 minutes 47 seconds of light review.
+
+================================================================================
+SECTION 10 — QUICK REFERENCE: EVERY DIAGRAM NODE EXPLAINED
+================================================================================
+
+NODE                        WHAT IT IS
+---------------------------------------------------------------------------
+Microphone (oval)           Start of the flow. The physical recording device.
+Consent Gate                Ensures patient consent before recording begins.
+Local Edge Agent            In-clinic device. Cleans, compresses, encrypts audio.
+  Noise Suppression         Removes AC hum, door sounds, paper rustling.
+  Voice Activity Detection  Strips silence, shrinks file size ~60%.
+  AES-256 Encryption        Locks the audio before it leaves the clinic.
+  Offline Buffer            Saves locally if internet drops.
+Audio Intake & Validation   First cloud step. Format check, normalize to 16kHz.
+Invalid Audio (red)         Triggered when audio is too corrupt to process.
+Alert Doctor (red)          Notifies doctor that recording failed.
+Dictation Fallback (red)    Doctor re-records manually. Skips ASR+Diarization.
+Speaker Diarization         Separates DOCTOR voice from PATIENT voice.
+Medical ASR Engine          Converts speech to text using medical vocabulary.
+Transcript Post-Processing  Spell-check, filler removal, sentence segmentation.
+Clean Labelled Transcript   Final structured transcript ready for LLM.
+Entity Extraction           LLM Pass 1. Pulls all clinical facts from text.
+Section Population          LLM Pass 2. Fills all 13 note sections in parallel.
+Consistency Check           LLM Pass 3. Verifies note is coherent and grounded.
+ICD-10 Suggester            Finds diagnosis codes (what is wrong) from Assessment.
+CPT Suggester               Finds procedure codes (what was done) from Plan/Exam.
+Progress Note Assembler     Joins 13 sections + codes into one complete note.
+Draft Note                  The full AI-generated note, ready for review.
+Doctor Review Interface     The screen where the doctor reviews and edits.
+Flagged Items Unresolved    Low-confidence items that need doctor action.
+  (loops back to Review)    Doctor cannot sign until all flags are resolved.
+Doctor Signs (oval)         Doctor's approval. Note becomes legally valid.
+Signed Note (cyan)          Immutable locked note. Entry point to output stage.
+EHR Integration (cyan)      Sends note to Epic/Athena/Cerner via FHIR R4.
+Epic / Athena / Cerner      The actual EHR systems. Patient chart is updated.
+Billing Submission (cyan)   Sends ICD-10 + CPT codes to insurance as a claim.
+Insurance Claims            The insurance company receives and processes the claim.
+EHR Dead Letter Queue (red) If EHR push fails 3 times. Admin is notified.
+Billing Dead Letter Queue   If billing push fails 3 times. Biller is notified.
+
+ARROW COLORS
+---------------------------------------------------------------------------
+Black / default  Normal flow — things working as expected.
+Red dashed       Error path or failure — something went wrong.
+Cyan             Output and delivery — after doctor signs.
+Green            Transcription parallel flows.
+Purple           Clinical extraction flows.
+Orange           Coding engine flows.
+Yellow           Doctor review flows.
+
+================================================================================
+SECTION 11 — THE THREE MOST IMPORTANT DESIGN RULES
+================================================================================
+
+If you remember nothing else from this document, remember these three:
+
+  1. BILLING IS ONLY REACHABLE THROUGH A SIGNED NOTE.
+     There is no path from "audio failed" or "processing failed" to
+     billing. You cannot accidentally bill for a visit where the note
+     wasn't completed and approved.
+
+  2. FLAGGED ITEMS CANNOT BE SILENTLY IGNORED.
+     Every item the AI was uncertain about must have an explicit human
+     action. Accept, Edit, or Delete. No bypassing. This protects both
+     the patient (clinical accuracy) and the clinic (billing integrity).
+
+  3. THE NOTE IS IMMUTABLE AFTER SIGNING.
+     Once the doctor signs, the note cannot be edited. Any corrections
+     must be made as an ADDENDUM (a new entry that says "correction to
+     the note from [date]"). This is a legal requirement — medical
+     records cannot be silently altered.
+
+================================================================================
+  END OF DOCUMENT
+  Version: 1.0 | Independence OS — AI Medical Scribe
+  Plain-English Explainer for New Team Members
+================================================================================

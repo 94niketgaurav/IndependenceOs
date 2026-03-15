@@ -1,0 +1,996 @@
+================================================================================
+  CLAIM SCRUBBING SYSTEM — COMPLETE FLOW EXPLAINED
+  Independence OS | Plain-English Walkthrough
+  For: Anyone reading this for the first time
+================================================================================
+
+This document is the companion explainer for the Claim Scrubbing System.
+It uses ONE real example all the way through — the same John Smith visit
+from the Medical Scribe system — so both systems connect naturally.
+
+Read this alongside the Eraser.io diagram. Every time you see
+[DIAGRAM:] in the text, find that node in the diagram.
+
+--------------------------------------------------------------------------------
+THE RUNNING EXAMPLE (same visit, next step)
+--------------------------------------------------------------------------------
+
+  DOCTOR:   Dr. Sarah Martinez
+  PATIENT:  John Smith, 61-year-old male
+  VISIT:    March 14, 2026 — chest pain + hypertension
+  STATUS:   The Medical Scribe system just produced a signed progress note.
+            Now the clinic needs to get paid for this visit.
+
+The note contains:
+  Diagnoses:  R09.1 (Pleurisy), I10 (Hypertension)
+  Procedures: 99214 (Office visit, moderate complexity), 93000 (EKG)
+  Insurance:  Blue Cross Blue Shield Illinois (BCBS-IL)
+
+This combination of codes + note + insurance = a CLAIM.
+The claim goes to BCBS-IL. BCBS-IL either pays it or denies it.
+
+================================================================================
+SECTION 0 — WHY DOES THIS SYSTEM EXIST?
+================================================================================
+
+About 30% of all claims sent to insurance companies get DENIED.
+The clinic does not get paid. Staff have to investigate, correct, and
+resubmit. Some claims are written off entirely — the clinic loses the money.
+
+Here is the important part: MOST DENIALS ARE PREVENTABLE.
+
+The errors that caused the denial were already in the claim before it was
+ever sent. The insurance company found the problem. The scrubber's job is
+to find that same problem FIRST — before the claim leaves the clinic.
+
+Common reasons claims get denied:
+  - A required field was blank (patient's insurance ID was missing)
+  - Two procedure codes were billed together but insurance says they can't be
+  - The progress note doesn't actually support the billing level claimed
+  - The diagnosis code doesn't justify the procedure that was billed
+  - Prior authorization was required but no auth number was included
+  - The claim was filed after the insurance company's time limit
+
+THE GOAL: Catch all of these BEFORE submission.
+Move the denial rate from 30% → under 5%.
+
+HOW: Run 5 layers of checks on every claim simultaneously, in under 10 seconds.
+
+================================================================================
+SECTION 1 — WHAT IS A CLAIM?
+================================================================================
+
+Before diving into the system, it helps to understand what a claim is.
+
+A claim is a formal request for payment sent to an insurance company. It is
+NOT just the progress note. It is a structured form (called CMS-1500 or 837P)
+that contains:
+
+  PATIENT INFO:    Name, date of birth, insurance member ID
+  PROVIDER INFO:   Doctor's name, NPI number (unique provider ID), address
+  PAYER INFO:      Insurance company name and payer ID
+  VISIT INFO:      Date of service, place of service (office = code 11)
+  DIAGNOSIS CODES: ICD-10 codes — what was wrong with the patient
+  PROCEDURE CODES: CPT codes — what the doctor did
+  CHARGES:         How much the clinic is charging for each procedure
+  LINKED NOTE:     The progress note that backs up all the codes
+
+The insurance company checks every single field against their rules.
+Any mismatch = denial.
+
+For John Smith's visit, the claim looks like this:
+
+  Patient:    John Smith | DOB: 1965-03-12 | Member ID: XY123456
+  Provider:   Dr. Sarah Martinez | NPI: 1234567890
+  Payer:      Blue Cross Blue Shield Illinois
+  Date:       March 14, 2026 | Place: Office (POS 11)
+  Diagnoses:  R09.1 (Pleurisy), I10 (Hypertension)
+  Procedures: 99214 - $185.00, 93000 - $55.00
+  Total:      $240.00
+
+================================================================================
+SECTION 2 — STAGE 1: INPUT AND INTAKE
+  [Diagram nodes: EHR System → Claim Builder → Raw Claim →
+   Claim Intake and Parser]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Once Dr. Martinez signs the note, the clinic's billing system automatically
+assembles the claim. Think of it like filling out a tax form — it pulls
+the patient's info, the doctor's info, the codes from the note, and puts
+them all into the standard claim format.
+
+This "raw claim" is then handed to the Claim Intake and Parser.
+The parser does two things:
+
+  1. NORMALIZE THE FORMAT
+     Claims can come in slightly different formats depending on which billing
+     system the clinic uses. The parser converts everything into one standard
+     internal format so all the scrubbing layers can read it consistently.
+
+  2. RESOLVE RECORDS
+     It looks up the patient record (confirms the insurance ID is active),
+     looks up the payer record (confirms what rules apply to BCBS-IL),
+     and links the progress note so Layer 4 can read it.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+EHR SYSTEM outputs an 837P EDI transaction (the standard electronic claim
+format) or a JSON payload via API, depending on the EHR connector type.
+
+CLAIM BUILDER assembles the 837P fields from:
+  - Patient demographics from EHR
+  - Provider details from practice settings
+  - ICD-10 / CPT codes from the signed progress note
+  - Charge amounts from the fee schedule
+
+CLAIM INTAKE AND PARSER:
+  - Normalizes to internal ClaimDTO (Data Transfer Object)
+  - Resolves payer_id to the correct Payer record in the database
+  - Fetches the linked progress note text for Layer 4
+  - Runs a real-time eligibility check (confirms patient is covered today)
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  EHR System [blue]
+      ↓
+  Claim Builder [blue]
+      ↓
+  Raw Claim [blue]
+      ↓
+  Claim Intake and Parser [blue]
+      ↓ (5 parallel arrows — all 5 layers start simultaneously)
+  [Scrubbing Engine]
+
+================================================================================
+SECTION 3 — STAGE 2: THE SCRUBBING ENGINE (5 LAYERS IN PARALLEL)
+  [Diagram: Scrubbing Engine group containing all 5 layers,
+   all receiving input from Claim Intake and Parser simultaneously]
+================================================================================
+
+This is the core of the system. All 5 layers receive the claim at the
+same time and run simultaneously. Total target time: under 10 seconds.
+
+Think of it like 5 different specialists reviewing the same file at once:
+  - A compliance officer (Layer 1)
+  - A coding expert (Layer 2)
+  - A payer policy specialist (Layer 3)
+  - A documentation auditor (Layer 4)
+  - A data analyst who has seen thousands of claims (Layer 5)
+
+------------------------------------------------------------------------
+LAYER 1 — STRUCTURAL VALIDATION
+  What it asks: "Is everything filled in correctly?"
+------------------------------------------------------------------------
+
+PLAIN ENGLISH:
+  Before checking whether the codes are right, check whether the FORM is
+  filled out correctly. This is like proofreading a job application before
+  worrying about whether the candidate is qualified.
+
+  For John Smith's claim, Layer 1 checks:
+  - Is John's insurance member ID present and formatted correctly? ✓
+  - Is Dr. Martinez's NPI number valid? (There's a checksum on NPI numbers
+    like a credit card check.) ✓
+  - Do R09.1 and I10 exist as valid ICD-10 codes in 2026? ✓
+  - Does CPT 99214 and 93000 exist in 2026? ✓
+  - Is March 14, 2026 in the past (not the future)? ✓
+  - Was the claim submitted within BCBS-IL's filing deadline?
+    (Most payers require submission within 90-180 days of the visit.) ✓
+  - Is the place of service code "11" (office) a valid code? ✓
+
+  If any of these fail → BLOCKING error. The claim literally cannot be
+  processed until the missing information is supplied.
+
+TECHNICALLY:
+  Pure rule validation. No machine learning. ICD-10 and CPT codebooks
+  are loaded into a Redis set at startup. NPI validation uses the Luhn
+  algorithm. Rules run as a validation chain. Each check takes < 1ms.
+
+  Codebook freshness: ICD-10 updates every October 1. CPT updates every
+  January 1. An automated job runs on those dates to flag any active
+  claims using codes that were just deleted or changed.
+
+------------------------------------------------------------------------
+LAYER 2 — CLINICAL RULES (CCI / NCCI / LCD / NCD)
+  What it asks: "Are these codes allowed together? Does this diagnosis
+                justify this procedure?"
+------------------------------------------------------------------------
+
+PLAIN ENGLISH:
+  This layer enforces published government coding rules. There are three
+  types of rules here:
+
+  RULE TYPE 1 — CCI EDITS (Can these procedure codes be billed together?)
+    The government (CMS) publishes quarterly tables of CPT code pairs that
+    CANNOT be billed together on the same visit without a special modifier.
+    There are ~250,000 such pairs.
+
+    Example (NOT from John's claim, but to illustrate):
+    If Dr. Martinez billed BOTH 99214 (E&M visit) AND 20610 (joint injection)
+    on the same day WITHOUT a modifier 25 on the E&M code — DENIED.
+    The modifier 25 says: "the E&M visit was a separately identifiable service
+    from the procedure." Without it, the payer assumes the visit is included
+    in the procedure fee.
+
+    For John's claim: 99214 + 93000 (EKG). This combination IS allowed
+    together without a modifier. ✓
+
+  RULE TYPE 2 — NCCI BUNDLING (Is one code already included in another?)
+    Some procedure codes INCLUDE other procedure codes by definition.
+    You cannot bill for both the whole AND one of its parts separately.
+
+    Example: If you bill 27447 (total knee replacement), you CANNOT also
+    bill 27310 (arthrotomy of the knee) — because opening the knee is
+    already part of the replacement procedure.
+
+  RULE TYPE 3 — LCD / NCD (Does this diagnosis make this procedure
+                medically necessary?)
+    Every CPT procedure has a list of ICD-10 diagnoses that justify it.
+    If your diagnosis is NOT on that list — the payer says "not medically
+    necessary" and denies.
+
+    Example: If Dr. Martinez had ordered an MRI of the spine (CPT 72148)
+    and billed it with Z00.00 (routine annual exam), it would be denied.
+    An MRI of the spine is only covered for diagnoses like M54.5 (low
+    back pain) or M51.16 (disc herniation) — not routine exams.
+
+    For John: 93000 (EKG) is being billed. The diagnoses are R09.1 and I10.
+    Pleurisy and hypertension are both on the LCD coverage list for EKG. ✓
+
+TECHNICALLY:
+  CCI data: CMS quarterly CSV files loaded into a hash map:
+    {(cpt_a, cpt_b): modifier_required?} — O(1) lookup per pair.
+  LCD data: CMS LCD database (~2,000 LCDs), loaded per MAC region.
+  Rules stored in Rule Cache (Redis) for sub-millisecond lookup.
+
+------------------------------------------------------------------------
+LAYER 3 — PAYER-SPECIFIC RULES
+  What it asks: "What does THIS specific insurance company require
+                that is different from the standard rules?"
+------------------------------------------------------------------------
+
+PLAIN ENGLISH:
+  Each insurance company has its own additional rules on top of the
+  government rules. There are 1,000+ payers. Each has their own policies.
+  These change quarterly with minimal notice.
+
+  Examples of payer-specific rules:
+  - "We require prior authorization before you can bill CPT 27447
+    (knee replacement). You need to get our approval first."
+  - "We only reimburse for CPT 93000 (EKG) if the patient has a
+    cardiac diagnosis — R09.1 (pleurisy) is not sufficient by itself."
+  - "Claims must be submitted within 90 days. BCBS's standard is 180
+    days, but we have our own tighter window."
+
+  For John's claim, Layer 3 checks BCBS-IL's specific rules:
+  - Does 99214 require prior auth with BCBS-IL? No. ✓
+  - Does 93000 require prior auth with BCBS-IL? No. ✓
+  - Is there a BCBS-IL rule about pleurisy + EKG? No. ✓
+  - Is the $240 total charge within the normal range for BCBS-IL?
+    (Extremely high charges get flagged as possible data entry errors.) ✓
+
+  All checks pass for John's claim.
+
+WHERE DO THESE RULES COME FROM?
+  Three sources, run simultaneously (called the Triple-Source Strategy):
+
+  Source 1 — CLEARINGHOUSE FEED: Companies like Availity and
+    Change Healthcare maintain pre-built payer rule databases covering
+    ~600 of the top payers. These update automatically.
+
+  Source 2 — PAYER PORTAL SCRAPER: A weekly automated job monitors
+    each payer's provider portal website for policy updates. When changes
+    are detected, a human reviewer approves the new rule before it goes live.
+
+  Source 3 — DENIAL FEEDBACK: When a claim gets denied for a reason
+    that wasn't in the rules database, that denial pattern is analyzed and
+    a new candidate rule is created. Human reviews and approves it.
+    Now the system knows about that rule. (More on this in Section 9.)
+
+TECHNICALLY:
+  Rules stored in PostgreSQL with effective_date and expiry_date.
+  A claim for a DOS in the past uses the rules from that date —
+  not today's rules. Critical for handling late submissions and appeals.
+  Cached in Redis (per payer hash map) for fast lookup.
+
+------------------------------------------------------------------------
+LAYER 4 — DOCUMENTATION AUDIT (LLM)
+  What it asks: "Does the progress note actually justify what was billed?"
+------------------------------------------------------------------------
+
+PLAIN ENGLISH:
+  This is the most important layer — and the one no rule database can
+  replace. It answers: does what the doctor WROTE support what the
+  doctor BILLED?
+
+  Remember from the Medical Scribe system: the codes were generated from
+  the note. But could the codes be wrong? Could the note be too vague?
+  Could the AI scribe have suggested a higher billing level than the note
+  actually supports?
+
+  Layer 4 reads the progress note and runs THREE checks:
+
+  CHECK A — E&M LEVEL AUDIT (Did the note justify 99214?)
+    The visit level code (99213, 99214, 99215) determines the bulk of
+    reimbursement. To justify each level, the note must document a certain
+    complexity of medical thinking. This is called Medical Decision Making (MDM).
+
+    MDM has 3 components:
+      1. How many problems did the doctor address?
+         - John has: pleuritis (new problem needing workup) + hypertension
+           (existing chronic illness). This = MODERATE complexity.
+      2. How much data was reviewed?
+         - Dr. Martinez ordered a D-dimer and EKG, and reviewed results.
+           This = LOW-MODERATE.
+      3. How risky were the decisions?
+         - Ruling out a pulmonary embolism (PE) is HIGH risk.
+           But overall treatment is moderate (NSAIDs, follow-up). = MODERATE.
+
+    Score 2 of 3 components at MODERATE or higher → 99214 is justified. ✓
+
+    If the note only supported 99213 but 99214 was billed → BLOCKING error.
+    This is called UPCODING — billing for more complexity than documented.
+    It is considered fraud. The system stops it before submission.
+
+    If the note supported 99215 but only 99214 was billed → WARNING.
+    This is DOWNCODING — the clinic is leaving money on the table.
+    The system flags it so the biller can upgrade the code.
+
+  CHECK B — DIAGNOSIS SUPPORT (Is every diagnosis code actually in the note?)
+    R09.1 (Pleurisy) — Is pleurisy mentioned in the note? Yes. ✓
+    I10 (Hypertension) — Is hypertension mentioned? Yes. ✓
+
+    If a diagnosis code appears on the claim but is nowhere in the note →
+    BLOCKING error. You cannot bill for a diagnosis that wasn't documented.
+
+  CHECK C — PROCEDURE DOCUMENTATION (Was the EKG actually performed?)
+    CPT 93000 (EKG) is billed. The note must say:
+      - The EKG was performed (not just "ordered")
+      - The interpretation/findings
+
+    Dr. Martinez wrote: "EKG performed — normal sinus rhythm, no ST changes."
+    Both boxes ticked. ✓
+
+    If the note only said "EKG ordered" → BLOCKING. You can only bill for
+    procedures you actually performed and documented.
+
+TECHNICALLY:
+  Three parallel Claude API calls, each with a structured JSON output:
+
+  Call A: MDM scoring prompt → returns {problems_score, data_score,
+    risk_score, supported_em_level, match, reasoning, confidence}
+
+  Call B: Diagnosis support prompt → for each ICD-10 code, returns
+    {code, supported: bool, evidence: "quote from note"}
+
+  Call C: Procedure documentation prompt → for each CPT, returns
+    {code, performed_documented: bool, findings_documented: bool, evidence}
+
+  Every finding must include an evidence quote from the note.
+  If confidence < 0.70, result escalates to senior biller for human review.
+  If confidence < 0.50, item is hard-flagged as uncertain.
+
+  HALLUCINATION GUARD: Same as Medical Scribe — if LLM returns a finding
+  with no evidence quote, it is discarded and sent to human review.
+
+NOTE AMENDMENT LOOP:
+  If Layer 4 finds that the EKG was "ordered not performed," the system
+  sends a note amendment request to Dr. Martinez:
+  "Please add EKG interpretation findings to your note for today's visit."
+  Dr. Martinez adds an addendum. Layer 4 re-runs on the updated note.
+  If it now passes → the issue is resolved → claim continues to submission.
+
+  IMPORTANT: The note amendment loop is shown in the diagram as a DASHED
+  yellow arrow going BACKWARD from Note Amendment Request to Layer 4.
+  This is the only backward arrow in the entire flow.
+
+------------------------------------------------------------------------
+LAYER 5 — ML DENIAL PREDICTOR
+  What it asks: "Even if everything looks right, is this claim
+                likely to get denied based on historical patterns?"
+------------------------------------------------------------------------
+
+PLAIN ENGLISH:
+  This layer is different from the other four. Layers 1-4 check KNOWN
+  rules. Layer 5 looks at PATTERNS — things that have gotten denied before
+  even when the claim looked correct.
+
+  Think of it like a colleague who has worked with BCBS-IL for 5 years
+  saying: "I don't know why, but they always deny knee replacements billed
+  on Fridays. Just avoid Fridays." The rule isn't published anywhere.
+  It's just a pattern that experience reveals.
+
+  Layer 5 is a machine learning model trained on tens of thousands of
+  past claims and their outcomes (paid or denied). It looks at:
+  - This exact combination of ICD-10 + CPT codes
+  - This specific payer
+  - The provider's history with this payer
+  - Whether prior auth is present
+  - The dollar amount of the claim
+
+  It outputs a DENIAL PROBABILITY:
+    0.13 → "Low risk, looks fine"
+    0.45 → "Elevated risk — here's why"
+    0.73 → "High risk — review before submitting"
+
+  For John's claim: 0.18. Low risk. No flag.
+
+  BUT — Layer 5 never produces a BLOCKING error. It is ADVISORY ONLY.
+  We cannot stop a claim just because the model thinks it might get denied.
+  A claim that looks 100% correct can still get a 0.73 risk score because
+  the payer has been quirky lately. The biller sees the score and decides.
+
+  HOW IT EXPLAINS ITSELF:
+  The model uses SHAP values — a technique that shows which factors
+  contributed most to the score. The biller sees something like:
+    "Denial probability: 73%
+     Top reasons:
+       +31% — This CPT+diagnosis pair denied 68% of the time with this payer
+       +22% — No prior auth on file
+       +12% — Claim amount in 94th percentile for this payer"
+
+  Now the biller has actionable information, not just a scary number.
+
+TECHNICALLY:
+  Model: LightGBM (gradient boosting) — fast inference (sub-millisecond),
+  handles sparse categorical features, interpretable via SHAP.
+  Retrained monthly on rolling 12-month window of paid/denied outcomes.
+  Minimum 500 claims per payer before payer-specific model activates.
+  Below threshold → uses specialty-level aggregate model.
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Claim Intake and Parser
+      ↓ (5 parallel arrows)
+  Layer 1 Structural Validation ─────────────────────────────┐
+  Layer 2 Clinical Rules ─────────────────────────────────────┤
+  Layer 3 Payer Rules ────────────────────────────────────────┤
+  Layer 4 Documentation Audit ────────────────────────────────┤
+  Layer 5 ML Denial Predictor ────────────────────────────────┤
+                                                             ↓
+                                              All 5 feed into:
+                                     Issue Aggregator and Prioritizer
+
+  Also in the diagram:
+  Payer Rules Engine [orange group] feeds BOTH Layer 2 and Layer 3
+  via Rule Cache. This is the Triple-Source rules database.
+
+================================================================================
+SECTION 4 — STAGE 3: ISSUE AGGREGATOR AND PRIORITIZER
+  [Diagram node: Issue Aggregator and Prioritizer]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+All 5 layers have finished and each has produced a list of issues they found.
+The aggregator collects ALL issues from ALL layers and sorts them by severity:
+
+  BLOCKING (❌):  The claim WILL be denied if submitted as-is.
+                  Must be fixed before submission is allowed.
+                  Examples: missing modifier, unsupported diagnosis,
+                  procedure documented as "ordered not performed."
+
+  WARNING (⚠️):  The claim has elevated denial risk.
+                  The biller must acknowledge each warning before submitting.
+                  They can choose to proceed, but they have to consciously
+                  do so — not accidentally.
+                  Examples: ML risk score > 40%, possible downcoding detected.
+
+  INFO (ℹ️):     Advisory only. Can be dismissed with one click.
+                  Examples: "Consider a more specific diagnosis code."
+
+For John's claim, suppose the aggregator finds:
+  ❌ BLOCKING — No modifier 25 on 99214, which was billed with 93000
+                (the EKG was performed during the same visit — CCI edit)
+  ⚠️ WARNING  — ML denial probability 18% (low — but reported for visibility)
+  ✓ PASS     — All other checks passed
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+Issues from all 5 layers arrive in a results queue. The aggregator:
+  - Deduplicates issues (two layers might catch the same thing)
+  - Assigns final severity (BLOCKING > WARNING > INFO)
+  - Groups related issues (same CPT code pair showing up in Layer 2 and 3)
+  - Calculates overall claim status: CLEAN / HAS_WARNINGS / HAS_BLOCKING
+  - Generates suggested_fix text for each issue
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  [All 5 layers] → Issue Aggregator and Prioritizer [yellow]
+      ↓
+  Remediation Interface
+
+================================================================================
+SECTION 5 — STAGE 4: REMEDIATION INTERFACE
+  [Diagram nodes: Remediation Interface → Auto Fix Engine +
+   Manual Review Queue + Note Amendment Request → All Blocking Issues Resolved]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+The billing specialist opens the claim on their screen. They see the
+scrub results — a prioritized list of issues with exactly what is wrong
+and what to do about it.
+
+For John's claim, they see:
+
+  ❌ BLOCKING ISSUE
+  "CPT 99214 and CPT 93000 billed on same date without modifier 25.
+   Per CCI Q1-2026, modifier 25 is required on the E&M code to indicate
+   it was a separately identifiable service from the EKG procedure."
+   → [Auto-fix: Add modifier 25 to 99214]   [View CCI rule]
+
+The biller clicks "Auto-fix." The system adds modifier 25 to the 99214
+line. The blocking issue is resolved.
+
+Now the claim looks like:
+  99214-25 (the "-25" is the modifier) — $185.00
+  93000                                 — $55.00
+
+The insurance company now knows: yes, we know the EKG was the main
+procedure, AND the E&M visit was a separate and identifiable service.
+Both are billable. No denial.
+
+---
+
+THREE PATHS THROUGH REMEDIATION:
+
+PATH 1 — AUTO-FIX (no human needed):
+  For issues that are purely formatting/coding corrections:
+  - Add a missing modifier
+  - Re-order diagnosis codes (primary diagnosis must be first)
+  - Remove a duplicate claim
+  The system fixes these automatically. Biller just reviews the change log.
+
+  HARD RULE: Auto-fix ONLY changes billing/coding fields (modifiers,
+  code order, formatting). It NEVER changes the actual diagnosis codes
+  or procedure codes. Those require human approval. Changing clinical
+  content without doctor sign-off is a compliance violation.
+
+PATH 2 — MANUAL REVIEW QUEUE (biller judgment call):
+  For issues requiring human decision:
+  - Prior authorization missing — biller must contact payer to get auth
+  - ML risk warning — biller decides whether to hold or proceed
+  - Payer-specific rule — biller verifies with payer portal directly
+
+PATH 3 — NOTE AMENDMENT REQUEST (doctor involvement):
+  For issues where the progress note itself is the problem:
+  - "EKG documented as ordered, not performed" — doctor must add findings
+  - "Diagnosis I10 not mentioned in note" — doctor must add documentation
+
+  THE AMENDMENT LOOP (the only backward arrow in the diagram):
+    1. System sends amendment request to Dr. Martinez's queue
+    2. Dr. Martinez adds an addendum (original note stays immutable)
+    3. Layer 4 Documentation Audit RE-RUNS on the updated note
+    4. If Layer 4 now passes → issue resolved → continues to submission
+    5. If Layer 4 still fails → back to Remediation Interface
+
+  CRITICAL: Note Amendment does NOT jump directly to the submission gate.
+  It must re-run Layer 4. If we allowed a direct shortcut, we could accept
+  a note amendment that still doesn't actually fix the problem.
+
+---
+
+THE BLOCKING ISSUE LOOP:
+  As long as ANY blocking issue remains unresolved, the claim cannot proceed.
+  The Remediation Interface loops back on itself until every blocking issue
+  is resolved.
+  [Diagram: Remediation Interface has a self-loop red dashed arrow]
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Issue Aggregator and Prioritizer
+      ↓
+  Remediation Interface [yellow]
+      ├─→ Auto Fix Engine [yellow]: auto-fixable issues
+      ├─→ Manual Review Queue [yellow]: judgment calls
+      └─→ Note Amendment Request [yellow]: documentation gaps
+               ↓ (dashed yellow arrow — goes BACKWARD)
+          Layer 4 Documentation Audit (re-runs)
+               ↓ (normal path forward)
+          Issue Aggregator → Remediation Interface → ...
+
+  Auto Fix Engine ─────────────────────────────────────────────┐
+  Manual Review Queue (biller resolves) ───────────────────────┤
+                                                               ↓
+                                           All Blocking Issues Resolved (oval)
+
+  Self-loop: Remediation Interface → Remediation Interface
+             (red dashed, label: "unresolved blocking issues")
+
+================================================================================
+SECTION 6 — STAGE 5: CLEAN CLAIM SUBMISSION
+  [Diagram nodes: All Blocking Issues Resolved → Clean Claim →
+   Clearinghouse → Payer]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+All blocking issues are resolved. All warnings have been acknowledged.
+The biller clicks "Submit."
+
+The claim — now corrected — is transmitted through a CLEARINGHOUSE.
+A clearinghouse is a middleman company (like Availity or Change Healthcare)
+that:
+  1. Validates the 837P file format one more time
+  2. Routes the claim to the correct insurance company
+
+The insurance company (BCBS-IL) receives the claim.
+
+For John's claim:
+  Before scrubbing: 99214 + 93000 — would have been denied (no modifier)
+  After scrubbing:  99214-25 + 93000 — properly formatted, should be paid
+
+------------------------------------------------------------------------
+WHAT IF THE CLEARINGHOUSE IS DOWN?
+------------------------------------------------------------------------
+
+  If the connection to the clearinghouse fails:
+  → Claim goes to LOCAL CLAIM QUEUE (stored locally)
+  → System retries automatically when connection is restored
+  → Biller is notified if retry fails after 3 attempts
+
+  [Diagram: red dashed arrow from Clearinghouse → Clearinghouse Down →
+   Local Claim Queue]
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+CLEAN CLAIM is assembled as a valid 837P EDI transaction with all
+corrections applied. The audit log records every change made during
+remediation (auto-fix or manual).
+
+CLEARINGHOUSE receives the 837P, runs its own format validation (a
+final safety net), then routes to the payer-specific endpoint.
+
+PAYER processes the claim against their adjudication rules and
+responds with an 835 ERA (Electronic Remittance Advice) file.
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  All Blocking Issues Resolved (oval) [yellow]
+      ↓
+  Clean Claim [cyan]
+      ↓
+  Clearinghouse [cyan]
+      ↓ (red dashed error path)  → Clearinghouse Down → Local Claim Queue
+      ↓ (normal)
+  Payer [cyan]
+
+================================================================================
+SECTION 7 — STAGE 6: PAYER RESPONSE
+  [Diagram nodes: Payer → ERA 835 Response → Paid / Denied]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+The insurance company processes the claim and sends back a response.
+This response is called an 835 ERA (Electronic Remittance Advice).
+
+TWO OUTCOMES:
+
+  PAID → Money is transferred. Claim is closed.
+          For John's claim: BCBS-IL approves $175.50 (their contracted rate
+          for 99214-25) + $42.00 (93000). Total: $217.50.
+          The clinic also bills John for his copay.
+          Done.
+
+  DENIED → The insurance company rejected the claim and explains why.
+            The denial reason comes as a standardized code in the 835:
+              CO-4  = "Claim/service lacks information"
+              CO-97 = "Payment included in another service"
+              OA-23 = "Prior authorization not obtained"
+
+            For John's claim: PAID. The modifier 25 fix worked.
+
+------------------------------------------------------------------------
+WHAT HAPPENS WHEN A CLAIM IS DENIED?
+------------------------------------------------------------------------
+
+A denied claim does NOT just disappear. It enters the FEEDBACK LOOP.
+(See Section 8 — this is what makes the system smarter over time.)
+
+Options for a denied claim:
+  1. CORRECT AND RESUBMIT: Fix the error, submit a corrected claim
+  2. APPEAL: Formally dispute the denial with the payer
+  3. WRITE OFF: If the denial is valid and uncorrectable, absorb the loss
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Payer [cyan]
+      ↓
+  ERA 835 Response [cyan]
+      ↓ (two paths)
+  Paid [cyan] → claim closed
+  Denied [cyan] → enters Feedback Loop [green]
+
+================================================================================
+SECTION 8 — STAGE 7: THE FEEDBACK LOOP
+  [Diagram nodes: Denied → Denial Analysis Pipeline →
+   Candidate Rule Generator + ML Model Retraining →
+   Human Rule Reviewer → Rule Store (loops back to Payer Rules Engine)]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Every denial that comes back is a lesson. The feedback loop captures
+that lesson and makes the scrubber smarter.
+
+SCENARIO: Suppose John's claim was denied with reason OA-23
+("Prior authorization not obtained") for CPT 93000 (EKG) from BCBS-IL.
+The scrubber missed this because there was no rule in the database saying
+"BCBS-IL requires prior auth for ECGs on patients with pleurisy only."
+That's a hyper-specific payer rule that was never in any published document.
+
+HERE IS WHAT HAPPENS:
+
+  STEP 1 — DENIAL ANALYSIS
+    The denial reason code (OA-23) is parsed from the 835 ERA file.
+    The system looks at the claim that was denied: what codes, what payer,
+    what reason.
+
+  STEP 2 — PATTERN DETECTION
+    It asks: "Have we seen this before?"
+    It finds: in the last 90 days, 14 other claims with CPT 93000 billed
+    to BCBS-IL were denied with OA-23. That's a pattern.
+
+  STEP 3 — CANDIDATE RULE CREATED
+    The system generates a candidate payer rule:
+      "BCBS-IL requires prior auth for CPT 93000.
+       Source: Denial feedback. Confidence: 0.82."
+
+  STEP 4 — HUMAN REVIEW
+    This candidate rule is sent to the billing manager for approval.
+    They verify it against the BCBS-IL provider portal. Confirmed — BCBS-IL
+    did quietly add a prior auth requirement in their January update.
+
+  STEP 5 — RULE ACTIVATED
+    The approved rule is added to the Rule Store.
+    From now on, every claim with BCBS-IL + CPT 93000 will get a
+    Layer 3 BLOCKING flag: "Prior auth required — get auth before billing."
+
+    No future claim will be denied for this reason.
+
+---
+
+SEPARATELY — ML MODEL RETRAINING:
+  ALL denials (not just new patterns) feed into the ML model retraining.
+  Monthly, the model is retrained on the updated dataset.
+  It gets better at predicting denials — including subtle patterns
+  that don't generate a discrete new rule.
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Denied [cyan]
+      ↓
+  Denial Analysis Pipeline [green]
+      ├─→ Candidate Rule Generator [green]: new pattern detected
+      │         ↓
+      │   Human Rule Reviewer [green]
+      │         ↓ "approved new rule"
+      │   Rule Store [orange] ← feeds back into Payer Rules Engine
+      │
+      └─→ ML Model Retraining [green]: all denials feed model
+                ↓ "updated model"
+          Layer 5 ML Denial Predictor (fed back into Scrubbing Engine)
+
+================================================================================
+SECTION 9 — THE COMPLETE FLOW IN ONE STORY
+================================================================================
+
+Let's trace John Smith's claim all the way through without stopping.
+
+------------------------------------------------------------------------
+
+2:05 PM — Dr. Martinez signs John's note. The Medical Scribe system
+locks the note. Billing system assembles the claim automatically.
+
+[DIAGRAM: EHR System → Claim Builder → Raw Claim]
+
+The claim contains: R09.1, I10, 99214, 93000. Total: $240.
+
+[DIAGRAM: Raw Claim → Claim Intake and Parser]
+
+Parser normalizes the format. Confirms John's insurance is active today.
+Looks up BCBS-IL rules. Links the progress note. Ready for scrubbing.
+
+[DIAGRAM: Claim Intake and Parser → 5 parallel arrows to all layers]
+
+2:05:03 PM — All 5 layers run simultaneously.
+
+Layer 1: NPI valid ✓, codes valid ✓, filed on time ✓, POS valid ✓
+Layer 2: CCI check — 99214 + 93000 billed together → NO MODIFIER 25.
+         This is a CCI edit violation. BLOCKING.
+         LCD check — 93000 for R09.1 + I10 → covered ✓
+Layer 3: BCBS-IL rules → no prior auth required for either code ✓
+Layer 4: E&M audit → 99214 supported by note (2 problems, moderate MDM) ✓
+         Diagnosis support → R09.1 and I10 both documented ✓
+         EKG documented as performed with findings ✓
+Layer 5: Denial probability = 0.18. Low risk. INFO only.
+
+[DIAGRAM: All 5 layers → Issue Aggregator and Prioritizer]
+
+2:05:09 PM — Aggregator collects results. One BLOCKING issue found.
+One INFO. Claim status: HAS_BLOCKING.
+
+[DIAGRAM: Issue Aggregator → Remediation Interface]
+
+2:05:09 PM — The billing specialist sees the scrub result on screen:
+
+  ❌ BLOCKING: CPT 99214 + 93000 — CCI edit — modifier 25 required on 99214
+  ℹ️ INFO:    ML denial probability 18% (low)
+
+  [Auto-fix: Add modifier 25]
+
+The billing specialist clicks Auto-fix.
+
+[DIAGRAM: Remediation Interface → Auto Fix Engine → All Blocking Issues Resolved]
+
+Modifier 25 added. 99214 → 99214-25. No more blocking issues.
+The INFO item is dismissed with one click.
+
+[DIAGRAM: All Blocking Issues Resolved → Clean Claim]
+
+2:05:15 PM — Clean claim transmitted through clearinghouse to BCBS-IL.
+
+[DIAGRAM: Clean Claim → Clearinghouse → Payer]
+
+--- (2 weeks later) ---
+
+BCBS-IL processes the claim and sends the 835 ERA response:
+  CPT 99214-25: $175.50 approved
+  CPT 93000:    $42.00 approved
+  Total payment: $217.50
+
+[DIAGRAM: Payer → ERA 835 Response → Paid]
+
+Claim closed. No denial. $217.50 deposited into clinic account.
+John's copay billed separately.
+
+[DIAGRAM: Paid — end of happy path]
+
+The denial analysis pipeline checks: no denial, no feedback needed.
+ML model notes this as a "paid" outcome for retraining.
+
+TOTAL TIME FROM NOTE SIGNING TO SUBMISSION: 12 seconds.
+(6 seconds scrubbing + human click to auto-fix + 2 seconds to send.)
+
+================================================================================
+SECTION 10 — HOW CLAIM SCRUBBING CONNECTS TO MEDICAL SCRIBE
+================================================================================
+
+These two systems are not separate — they are a continuous pipeline.
+
+  MEDICAL SCRIBE:
+    Audio → Transcript → Clinical Extraction → Coding → Doctor Signs Note
+
+  CLAIM SCRUBBING (picks up here):
+    Signed Note → Claim Builder → Scrubbing → Billing
+
+The ICD-10 and CPT codes that the Medical Scribe suggested are the SAME
+codes that the Claim Scrubber checks. If the scribe makes a coding mistake
+(suggests the wrong E&M level, or misses a required modifier), the
+scrubber catches it before money is lost.
+
+This is why Layer 4 (Documentation Audit) is so valuable — it is
+specifically designed to catch errors that the Medical Scribe system
+might have introduced. It re-reads the progress note and independently
+verifies that the codes are justifiable.
+
+Think of Medical Scribe as the WRITER and Claim Scrubbing as the EDITOR.
+Both need to be correct for the clinic to get paid.
+
+================================================================================
+SECTION 11 — QUICK REFERENCE: EVERY DIAGRAM NODE EXPLAINED
+================================================================================
+
+NODE                              WHAT IT IS
+---------------------------------------------------------------------------
+EHR System                        The clinic's patient records system.
+Claim Builder                     Assembles all claim fields from the EHR.
+Raw Claim                         The unvalidated claim before scrubbing.
+Claim Intake and Parser           Normalizes format, resolves records,
+                                  checks eligibility, links note.
+Scrubbing Engine                  Group containing all 5 layers.
+  Layer 1 Structural Validation   Checks form completeness and code validity.
+  Layer 2 Clinical Rules          CCI/NCCI bundling + LCD medical necessity.
+  Layer 3 Payer Rules             Payer-specific policies, prior auth.
+  Layer 4 Documentation Audit     LLM checks note vs. codes.
+  Layer 5 ML Denial Predictor     Historical pattern-based risk scoring.
+Payer Rules Engine                Group containing the rules database.
+  Clearinghouse Feed              Auto-updated rule data from Availity etc.
+  Payer Portal Scraper            Weekly automated policy monitoring.
+  Rule Store                      PostgreSQL rules with version history.
+  Rule Cache                      Redis cache for fast lookup.
+Issue Aggregator and Prioritizer  Collects all layer results, sorts by severity.
+Remediation Interface             Billing specialist's review screen.
+Auto Fix Engine                   Applies deterministic corrections automatically.
+Manual Review Queue               Human decision required.
+Note Amendment Request            Sends correction request back to doctor.
+All Blocking Issues Resolved      Submission gate. Only reachable when all
+(oval = gate)                     blocking issues are fixed.
+Clean Claim                       Corrected, validated claim ready to send.
+Clearinghouse                     Routing intermediary (Availity, Change HC).
+Payer                             The insurance company.
+ERA 835 Response                  The payer's payment/denial response.
+Paid                              Claim approved. Money sent.
+Denied                            Claim rejected. Enters feedback loop.
+Denial Analysis Pipeline          Parses denial reasons, detects patterns.
+Candidate Rule Generator          Proposes new payer rules from denials.
+Human Rule Reviewer               Billing manager approves new rules.
+ML Model Retraining               Monthly model update using denial outcomes.
+Clearinghouse Down (red)          Connection failure. Claim queued locally.
+Local Claim Queue (red)           Temporary hold for retry when restored.
+
+ARROW COLORS
+---------------------------------------------------------------------------
+Black / default  Normal flow — things working as expected.
+Red dashed       Error or failure path — something went wrong.
+Yellow dashed    Loop or retry path within the review stage.
+Cyan             Submission, payer, and payment flow.
+Green            Feedback and learning loop.
+Yellow           Review and remediation flow.
+Orange           Rules engine data flow.
+Purple           Scrubbing engine flow.
+
+================================================================================
+SECTION 12 — THE THREE MOST IMPORTANT RULES
+================================================================================
+
+  1. EVERY CLAIM MUST PASS THE SUBMISSION GATE.
+     "All Blocking Issues Resolved" is the ONLY entry point to Clean Claim.
+     There is no way to submit a claim with an unresolved blocking issue.
+     Auto-fixes, manual resolutions, and note amendments all route through
+     this gate. No shortcuts.
+
+  2. AUTO-FIX NEVER TOUCHES CLINICAL CONTENT.
+     Modifiers, code order, and formatting can be auto-fixed.
+     Actual diagnosis codes (ICD-10) and procedure codes (CPT) require
+     explicit human approval. Changing clinical data without authorization
+     is a compliance violation — potentially fraud.
+
+  3. THE NOTE AMENDMENT LOOP ALWAYS RE-RUNS LAYER 4.
+     When a doctor amends their note to fix a documentation gap, the system
+     does NOT simply trust that the amendment fixed the problem. It re-runs
+     the full documentation audit (Layer 4) and checks again. Only if Layer 4
+     passes does the issue get resolved. This prevents "sham amendments"
+     that don't actually address the coding issue.
+
+================================================================================
+  END OF DOCUMENT
+  Version: 1.0 | Independence OS — Claim Scrubbing System
+  Plain-English Explainer for New Team Members
+================================================================================
