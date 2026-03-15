@@ -1,0 +1,1334 @@
+================================================================================
+  CARE GAP DETECTION & CLOSURE — COMPLETE FLOW EXPLAINED
+  Independence OS | Plain-English Walkthrough
+  For: Anyone reading this for the first time
+================================================================================
+
+This document walks through the entire Care Gap Detection & Closure system
+from start to finish using ONE real patient example all the way through.
+Every stage is explained in plain English first, then technically. By the
+end, you should be able to look at the flowchart and narrate every node and
+arrow yourself.
+
+--------------------------------------------------------------------------------
+THE RUNNING EXAMPLE (used throughout this entire document)
+--------------------------------------------------------------------------------
+
+  DOCTOR:   Dr. Priya Patel, primary care physician, independent practice
+  PATIENT:  Maria Chen, 58-year-old female, Type 2 diabetes
+  CLINIC:   Patel Family Medicine, 10-provider independent practice
+  DATE:     March 2026
+
+Maria has been a patient at this clinic for 11 years. She is on the clinic's
+roster with Blue Cross Blue Shield Medicare Advantage — a plan that pays the
+clinic bonuses based on quality scores (called Value-Based Care, or VBC).
+
+We will follow what the system does for Maria — before her appointment,
+during it, after it, and all the way until her open care gaps are closed.
+
+================================================================================
+SECTION 0 — WHY DOES THIS SYSTEM EXIST?
+================================================================================
+
+------------------------------------------------------------------------
+THE CORE PROBLEM (plain English):
+------------------------------------------------------------------------
+
+Imagine you are a doctor running a busy practice. You see 18 patients a
+day. You have 4,000 active patients on your panel. Your job is not just
+to treat whoever walks in — your job is also to make sure every single
+one of those 4,000 patients is receiving the preventive care they need.
+
+That means:
+  - Every diabetic patient should have an A1C blood test every 12 months
+  - Every diabetic patient should have an annual eye exam
+  - Women 50-74 should have a mammogram every 2 years
+  - Adults 45-75 should have colorectal cancer screening
+  - Adults 18+ should get their annual flu shot
+  - And so on — ~90 different rules for different patient types
+
+A CARE GAP is the space between what a patient SHOULD have received
+and what they ACTUALLY received.
+
+Maria Chen has Type 2 diabetes. She last had a diabetic eye exam in
+February 2025. It is now March 2026. She is 13 months overdue.
+That is a care gap.
+
+The problem: How does a clinic with 4,000 patients know that Maria
+specifically is overdue? How do they tell her? How do they make sure
+it actually gets done — and confirm it got done?
+
+Without a system: The doctor might notice during Maria's visit.
+Or might not. Patients fall through the cracks constantly.
+
+With this system:
+  - The gap is identified automatically
+  - Maria is contacted proactively (before she even books an appointment)
+  - Dr. Patel sees the gap alert before the visit starts
+  - When the eye exam happens, the gap is marked closed automatically
+  - The clinic's quality score improves — which affects their revenue
+
+WHY REVENUE MATTERS HERE:
+
+Under Value-Based Care (VBC) contracts, insurance companies pay clinics
+BONUSES if they hit quality targets. For a 10-provider independent practice
+like Dr. Patel's, a single percentage point improvement in quality scores
+can be worth $50,000 to $200,000 per year in bonus payments.
+
+Maria's eye exam is not just good medicine. It is also worth money to the
+clinic — and the system knows exactly which patients are worth the most to
+track down.
+
+================================================================================
+SECTION 1 — STAGE 1: DATA INGESTION
+  [Diagram nodes: EHR Data Source → Patient Identity Resolution
+   Payer Claims Feed → Patient Identity Resolution
+   State IIS Registry → Patient Identity Resolution
+   HIE Connector → Patient Identity Resolution
+   Lab Results Gateway → Patient Identity Resolution]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+The care gap system cannot determine what Maria is missing unless it first
+knows what Maria HAS received. That information is scattered across multiple
+separate systems:
+
+  THE EHR (Electronic Health Record):
+  This is the clinic's own records system — every visit, diagnosis,
+  lab order, and prescription placed at this clinic. If Maria got her
+  A1C test at THIS clinic, the EHR knows about it.
+
+  PAYER CLAIMS:
+  Insurance companies see every claim from EVERY provider, not just
+  this clinic. If Maria got her eye exam at a specialist's office
+  across town, the clinic's EHR doesn't know — but Blue Cross Blue
+  Shield does, because they paid the specialist's bill.
+  This data arrives as insurance claims (standardized files called
+  837/835 EDI records). Lag time: 14 to 90 days after the service.
+
+  STATE IMMUNIZATION REGISTRY (IIS — Immunization Information System):
+  Every flu shot given anywhere in Illinois — at pharmacies, urgent
+  care clinics, schools, the county health department — is reported
+  to the state IIS. If Maria got her flu shot at Walgreens, the IIS
+  knows. The clinic can query it.
+
+  HIE (Health Information Exchange):
+  A shared database where hospitals and health systems in a region
+  post clinical data. If Maria went to Northwestern Hospital for a
+  colonoscopy, that result can appear in the HIE and be retrieved here.
+
+  LAB GATEWAY:
+  Direct electronic connections to Quest Diagnostics, LabCorp, and
+  in-house labs. Lab results arrive as HL7 ORU messages — standardized
+  electronic lab reports.
+
+---
+
+FOR MARIA: The system ingests overnight:
+  - EHR: Maria's last 11 years of visits at this clinic
+  - Payer Claims (BCBS): 2 years of claims (her last eye exam, every
+    A1C test, her last mammogram)
+  - State IIS: Her flu vaccination history
+  - Lab Gateway: Direct A1C results from Quest
+
+The system now has a more complete picture of Maria's health history
+than any single doctor could reconstruct from memory.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+Each data source connects via a different protocol:
+  - EHR: FHIR R4 bidirectional sync (near real-time)
+  - Payer Claims: 837/835 EDI file parsing + payer API (14-90 day lag)
+  - State IIS: SOAP/REST API + weekly batch export
+  - HIE: FHIR R4, IHE XDS, or HL7 ADT/ORU messages
+  - Lab Gateway: HL7 ORU v2.x messages (hours)
+
+All incoming records flow first to PATIENT IDENTITY RESOLUTION — the
+critical step described in Section 2. Nothing touches Maria's profile
+until the system is certain the record actually belongs to Maria.
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  EHR Data Source ─────────┐
+  Payer Claims Feed ────────┤
+  State IIS Registry ───────┼──► Patient Identity Resolution
+  HIE Connector ────────────┤
+  Lab Results Gateway ──────┘
+
+All five data sources feed into one central identity matching step.
+The color is BLUE for all data sources — they are inputs to the system.
+
+================================================================================
+SECTION 2 — STAGE 2: PATIENT IDENTITY RESOLUTION (EMPI)
+  [Diagram nodes: Patient Identity Resolution →
+   Longitudinal Patient Profile (matched)
+   Patient Identity Resolution → Data Staging Queue (unmatched, dashed red)
+   Data Staging Queue → Patient Identity Resolution (retry, dashed red)]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Here is the most dangerous problem in the entire system:
+
+What if the payer claims file contains a record for a DIFFERENT Maria Chen?
+
+There are 47,000 Maria Chens in the United States. A 58-year-old diabetic
+named Maria Chen who lives in Chicago could easily be confused with another
+Maria Chen in the same city.
+
+If the system accidentally attaches ANOTHER patient's eye exam result to
+OUR Maria Chen, it will close her care gap. The system thinks: "Eye exam
+done, all good." But OUR Maria never got the exam. She goes another year
+without anyone detecting her diabetic retinopathy.
+
+This is the "silent false closure" problem — the most dangerous failure
+mode in the entire system.
+
+To prevent this, every incoming record goes through PATIENT IDENTITY
+RESOLUTION before it can touch any patient's profile. Think of it as
+a bouncer checking IDs at the door.
+
+---
+
+THE FOUR TRUST LEVELS:
+
+  LEVEL 1 — AUTOMATIC MATCH, NO REVIEW NEEDED:
+  The clinic already told us "this Blue Cross member ID #BC-4521-9988
+  is our patient Maria Chen, MRN 10042." That mapping was made explicitly
+  when the clinic enrolled Maria in the system. Perfect certainty.
+  → Record attached automatically.
+
+  LEVEL 2 — HIGH CONFIDENCE, AUTOMATIC, LOGGED:
+  The record shows: DOB 1967-09-14, Female, Last name "Chen," first
+  name "Maria," zip code 60614. All five fields match Maria's profile
+  exactly (last name similarity ≥ 95% by Jaro-Winkler scoring — an
+  algorithm that measures how close two strings are).
+  → Record attached automatically. Match logged for audit.
+
+  LEVEL 3 — PROBABLE MATCH, HUMAN REVIEW REQUIRED:
+  The record shows: DOB 1967-09-14, Female, Last name "Chen," but
+  first name "M." and zip code is 60615 (one digit off from 60614).
+  Three of five fields match above threshold — probably the same
+  person, but not certain enough to auto-attach.
+  → Record goes to STAGING QUEUE.
+  → Evidence HELD. Does NOT touch Maria's profile until a human
+    (a care coordinator) reviews and confirms the link.
+
+  LEVEL 4 — NO MATCH:
+  The record has no demographic overlap with anyone in the system.
+  → Staged indefinitely. Searchable manually.
+
+---
+
+FOR MARIA: Most of her records match at Level 1 or Level 2. Her BCBS
+claims are Level 1 (explicitly mapped). Her Quest lab results are
+Level 2 (exact DOB + last name match). One HIE record from a hospital
+visit 8 years ago is Level 3 — it has her DOB but her name is listed as
+"Mary Chen" (a transcription error from the hospital's old system). That
+one gets flagged for a care coordinator to review before it's attached.
+
+---
+
+WHAT ABOUT THE EDGE CASE?
+
+  Q: "What if there really ARE two patients named Maria Chen in this
+     practice?"
+
+  A: Each internal patient has a unique UUID (a permanent internal ID).
+     The system never confuses them by name alone. Matching uses
+     demographic combinations, not names in isolation. Two patients
+     named Maria Chen would have different DOBs, different member IDs,
+     different zip codes. They would correctly resolve to separate
+     Longitudinal Patient Profiles.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+EMPI (Enterprise Master Patient Index): The identity resolution service.
+Implements FHIR $Patient.match operation for standardized API access.
+
+Matching algorithm:
+  - Level 1: Explicit cross-reference table (clinic_id, EHR MRN, payer member ID)
+  - Level 2: Jaro-Winkler string similarity ≥ 0.95 on last name + exact DOB + sex
+  - Level 3: 3-of-5 field fuzzy match (DOB, sex, first name, last name, zip)
+  - Level 4: No qualifying match
+
+All links are stored in PatientIdentityLink records:
+  - trust_level: 1, 2, or 3
+  - approved_by: required for Level 3 (human reviewer UUID)
+  - revocable: False for Level 1-2, True for Level 3
+
+LONGITUDINAL PATIENT PROFILE: The unified view of one patient's health
+history after all matched evidence is assembled. This is the input to
+the Measure Evaluation Engine.
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Patient Identity Resolution ──────► Longitudinal Patient Profile
+                              ─ ─ ─► Data Staging Queue (red dashed)
+  Data Staging Queue ─ ─ ─ ─ ─ ─ ─► Patient Identity Resolution
+                                      (retry after human review, red dashed)
+
+The solid arrow is the happy path. The red dashed arrows show the
+unmatched record path — records held in staging until a human reviews.
+GREEN color for identity resolution and patient profile nodes.
+
+================================================================================
+SECTION 3 — STAGE 3: MEASURE EVALUATION ENGINE
+  [Diagram nodes: Longitudinal Patient Profile → Denominator Evaluator
+   Measure Spec Store → Denominator Evaluator (+ Exclusion + Numerator)
+   Denominator Evaluator → Exclusion Evaluator
+   Exclusion Evaluator → Numerator Evaluator
+   Numerator Evaluator → Gap Record Store]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Now the system has Maria's complete health history assembled. The next
+question is: What is she SUPPOSED to have had, and does the record show
+she received it?
+
+This is where HEDIS quality measures come in.
+
+HEDIS stands for Healthcare Effectiveness Data and Information Set.
+It is a set of ~90 standardized rules published annually by NCQA
+(National Committee for Quality Assurance). Think of HEDIS as the
+official rulebook for "what counts as good preventive care."
+
+Each HEDIS measure defines:
+  - Who is ELIGIBLE (the denominator — which patients does this apply to?)
+  - Who is EXCLUDED (certain patients are exempt for medical reasons)
+  - What counts as COMPLETING the measure (the numerator — what service
+    was received, and in what time window?)
+
+The system evaluates Maria against ALL 90 measures, in three phases:
+
+---
+
+PHASE 1 — DENOMINATOR EVALUATION (Is Maria eligible for this measure?)
+
+  EXAMPLE: Diabetic Eye Exam (HEDIS measure "CDC-Eye")
+  Rule: "Patients 18-75 with Type 2 diabetes, enrolled in this plan
+         for at least 11 months this year."
+  Maria: 58 years old, has Type 2 diabetes (ICD-10 code E11.9 in her
+         record), enrolled in BCBS Medicare Advantage for 12 months.
+  Result: Maria IS in the denominator. She is eligible.
+
+  EXAMPLE: Breast Cancer Screening (HEDIS measure "BCS-E")
+  Rule: "Women 50-74 enrolled for 11+ months."
+  Maria: 58 years old, female, enrolled 12 months.
+  Result: Maria IS eligible for breast cancer screening too.
+
+---
+
+PHASE 2 — EXCLUSION EVALUATION (Is Maria exempt?)
+
+  This phase asks: Is there a medical reason Maria should NOT receive
+  this service?
+
+  EXAMPLE: Bilateral mastectomy patients are excluded from breast
+  cancer screening. There is no point sending them for a mammogram.
+
+  IMPORTANT: Exclusions are evaluated INDEPENDENTLY per measure.
+  A patient in hospice is excluded from ALL measures (no point in
+  preventive care for someone in end-of-life care). But a patient
+  who had a mastectomy is only excluded from the breast cancer
+  measure — NOT from diabetic eye exams or colorectal screening.
+
+  FOR MARIA: She has no exclusions on file for any measure. She passes
+  Phase 2 for all measures she was eligible for.
+
+---
+
+PHASE 3 — NUMERATOR EVALUATION (Has Maria met the measure?)
+
+  This phase asks: Did she actually get the service?
+
+  EXAMPLE: Diabetic Eye Exam
+  Rule: "Retinal or dilated eye exam performed in the last 12 months."
+  Code sets checked: specific CPT codes for retinal exams
+  Data sources checked: EHR procedures, payer claims, HIE
+  Maria's record: Last retinal exam — February 12, 2025.
+  Today: March 15, 2026.
+  That is 13 months ago. Outside the 12-month window.
+  Result: CARE GAP OPEN.
+
+  EXAMPLE: A1C Test (HEDIS measure "CDC-HbA1c")
+  Rule: "A1C test performed in the last 12 months."
+  Maria's record: Last A1C — October 3, 2025. (5 months ago)
+  Result: NOT a gap. A1C is current. No action needed.
+
+---
+
+WHAT ABOUT ANNUAL UPDATES?
+
+Each HEDIS measure is stored as a VERSIONED SPECIFICATION with an
+effective date. When NCQA releases updated rules each October, the
+system loads the new spec rows with effective_date = next January 1.
+Historical evaluations still use the spec that was current at the time.
+No code deployment needed — updating the rules is a database update.
+
+If an insurance company has slightly different requirements than the
+HEDIS standard (Aetna might require annual mammograms instead of
+biennial), those are stored as PAYER OVERRIDES that inherit from the
+base spec and change only the specific fields that differ.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+MEASURE SPEC STORE: Versioned MeasureSpec rows (measure_id, hedis_year,
+effective_date, denominator rules, exclusion code sets, numerator code
+sets and lookback windows). PayerMeasureOverlay rows for payer-specific
+modifications.
+
+THREE-PHASE EVALUATION runs per patient × measure combination:
+  Phase 1 (Denominator): Age/sex check, enrollment months, qualifying
+                         diagnosis codes for condition-based measures
+  Phase 2 (Exclusion): Diagnosis code set lookup, procedure code lookup,
+                       manual exclusion registry, hospice enrollment check
+  Phase 3 (Numerator): Service code lookup across all data sources
+                       within lookback window; result check if required
+
+MEASURE EVALUATION is STATELESS and PARALLELIZABLE — each patient-measure
+pair can be evaluated independently on separate workers.
+
+RECALCULATION TRIGGER MODEL (dirty-flag priority queue):
+  NOT every patient re-evaluated every night (too slow at scale).
+  Instead:
+    - Data event arrives → set needs_recalculation=true on patient profile
+    - Tier 1 (HIGH priority): likely closure event → process within 15 min
+    - Tier 2 (STANDARD): new data → process within 24 hours
+    - Nightly batch: patients with no recent events → rolling 30-day refresh
+    - January 1: full population recalculation for annual measure reset
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Longitudinal Patient Profile ─────► Denominator Evaluator ┐
+  Measure Spec Store ────────────────► Denominator Evaluator ┤ (Phase 1)
+  Measure Spec Store ────────────────► Exclusion Evaluator   ┤ (Phase 2)
+  Measure Spec Store ────────────────► Numerator Evaluator   ┘ (Phase 3)
+
+  Denominator Evaluator ─────► Exclusion Evaluator (eligible patients only)
+  Exclusion Evaluator ───────► Numerator Evaluator (non-excluded patients)
+  Numerator Evaluator ───────► Gap Record Store (open or closed gap result)
+
+PURPLE color for the Measure Evaluation Engine nodes.
+The Measure Spec Store feeds all three phases (three separate arrows).
+
+================================================================================
+SECTION 4 — STAGE 4: GAP RECORD & PRIORITY SCORING
+  [Diagram nodes: Gap Record Store → Priority Scorer
+   Gap Record Store → Provider Gap Summary
+   VBC Financial Report → Priority Scorer
+   Priority Scorer → Outreach Campaign Manager]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+A care gap has been found for Maria: her diabetic eye exam is overdue.
+The system now creates a formal GAP RECORD for this finding. Think of
+a gap record as a case file that tracks everything about this specific
+gap from discovery to closure.
+
+The gap record for Maria includes:
+  - Patient: Maria Chen (UUID)
+  - Measure: CDC-Eye (Diabetic Eye Exam)
+  - HEDIS Year: 2026
+  - Payer: BCBS Medicare Advantage
+  - Status: OPEN
+  - Opened: March 15, 2026
+  - Last completed: February 12, 2025
+  - Evidence list: empty (nothing recent enough to close it)
+  - Priority Score: calculated next
+
+---
+
+NOT ALL GAPS ARE EQUAL — PRIORITY SCORING:
+
+The clinic has 4,000 patients. There are probably hundreds of open gaps
+across the panel. They cannot call every patient today. The system must
+decide: Who needs to be reached FIRST?
+
+Priority Score uses four factors, each weighted:
+
+  1. CLINICAL URGENCY (40% of score):
+     How dangerous is it that this went undone?
+     Maria's eye exam: 13 months overdue for a diabetic patient.
+     Untreated diabetic retinopathy can cause permanent blindness.
+     Clinical urgency: HIGH (score: 85/100)
+
+  2. VBC FINANCIAL IMPACT (35% of score):
+     Is this patient on a contract that pays the clinic a bonus for
+     closing this gap? How close is the clinic to the bonus threshold?
+     Maria is on BCBS Medicare Advantage, which has a VBC contract
+     that specifically weighs diabetic eye exams. The clinic is 3
+     patients away from crossing the 80% threshold for Tier 2 bonus
+     ($47,500 bonus at stake). Maria's closure would count toward that.
+     Financial impact: HIGH (score: 92/100)
+
+  3. OUTREACH RECEPTIVENESS (15% of score):
+     Does the system have good contact info? Has she responded before?
+     Maria has a verified cell phone and has replied to SMS messages
+     before. Her preferred language is English (templates available).
+     Receptiveness: HIGH (score: 88/100)
+
+  4. PRACTICE CONTRACT WEIGHT (10% of score):
+     Is this specific measure heavily weighted in the contract?
+     Diabetic eye exam is in the BCBS MA Quality Incentive Program.
+     Contract weight: HIGH (score: 90/100)
+
+  FINAL PRIORITY SCORE:
+  (85 × 0.40) + (92 × 0.35) + (88 × 0.15) + (90 × 0.10)
+  = 34 + 32.2 + 13.2 + 9
+  = 88.4 out of 100
+  → Maria's eye exam gap is HIGH priority.
+
+---
+
+PROVIDER GAP SUMMARY (the highest-ROI feature):
+
+The gap record feeds TWO things simultaneously:
+
+  1. The outreach engine (described in Section 5)
+  2. The PROVIDER GAP SUMMARY — a real-time summary shown to Dr. Patel
+     right before Maria's next visit
+
+When Maria books a wellness exam appointment, the care gap system
+pushes a pre-encounter alert to the Medical Scribe interface:
+
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  OPEN CARE GAPS — MARIA CHEN (DOB: 1967-09-14)              ║
+  ║══════════════════════════════════════════════════════════════║
+  ║  🔴 OVERDUE 13 months: Diabetic Eye Exam (last: Feb 2025)   ║
+  ║                         [Refer to ophthalmology →]           ║
+  ║  🟡 DUE THIS MONTH:    Flu Vaccine (not yet this season)    ║
+  ║                         [Order flu shot →]                   ║
+  ╚══════════════════════════════════════════════════════════════╝
+
+Dr. Patel sees this before she walks in the door. In-visit gap closure
+rates are 3 to 5 times higher than outreach-driven closure — because
+the doctor can place the referral right now while Maria is sitting there.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+GAP RECORD STORE: PostgreSQL table with CareGap rows:
+  gap_id, patient_id, clinic_id, measure_id, hedis_year, payer_id,
+  status (OPEN/IN_PROGRESS/CLOSED/EXCLUDED/PATIENT_DECLINED),
+  opened_at, closed_at, not_due_until, priority_score,
+  evidence (list, append-only), outreach_campaign reference,
+  exclusion_reason.
+
+PRIORITY SCORER:
+  priority_score = (clinical_urgency × 0.40)
+                 + (vbc_financial_impact × 0.35)
+                 + (outreach_receptiveness × 0.15)
+                 + (practice_contract_weight × 0.10)
+  Each sub-score is 0-100. Final score is 0-100.
+
+VBC FINANCIAL REPORT feeds current-contract-performance context into
+Priority Scorer so patients that would push the clinic over a bonus
+threshold are elevated.
+
+PROVIDER GAP SUMMARY: Called via GapSummaryAPI at encounter creation.
+Returns top N open gaps sorted by priority score. Integration point
+with Medical Scribe system.
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Gap Record Store ──────────► Priority Scorer
+  Gap Record Store ──────────► Provider Gap Summary: pre-encounter display
+  VBC Financial Report ──────► Priority Scorer: financial weighting
+  Priority Scorer ───────────► Outreach Campaign Manager
+  Provider Gap Summary ──────► Note Signed Event: provider addresses gap
+                                during visit (teal dashed — cross-system)
+
+ORANGE color for gap management and prioritization nodes.
+
+================================================================================
+SECTION 5 — STAGE 5: OUTREACH ENGINE
+  [Diagram nodes: Outreach Campaign Manager → Channel Dispatcher →
+   SMS Gateway / Patient Portal Message / Automated Voice / Letter Service →
+   Outreach Response Handler]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Maria has a high-priority open gap. She hasn't booked an appointment yet.
+So the system needs to REACH HER to let her know.
+
+But it can't just blast a message to everyone. There are rules:
+
+  TCPA COMPLIANCE: The Telephone Consumer Protection Act requires
+  explicit written consent before sending automated SMS messages.
+  If Maria has not opted in to SMS from this clinic, the system
+  CANNOT text her, no matter how urgent the gap is.
+
+  PATIENT PREFERENCES: If Maria has told the clinic she prefers
+  the patient portal over phone calls, the system should respect that.
+
+  LANGUAGE: If Maria's preferred language is Mandarin, the message
+  needs to be in Mandarin. If the clinic doesn't have a Mandarin
+  template for this message, they should call with an interpreter
+  instead of sending a confusing English text.
+
+---
+
+FOR MARIA: She opted in to SMS when she registered. She has a
+verified cell phone. English is her primary language. The system
+decides to start with SMS.
+
+Day 1 — Maria receives this text from the clinic:
+
+  "Hi Maria — Dr. Patel's office here. We noticed you're due for
+   your annual diabetic eye exam (it helps catch early vision
+   problems from diabetes). We can refer you to an eye specialist
+   — no appointment at our office needed. Would you like us to
+   send the referral? Reply YES or call us at (312) 555-0100.
+   Reply STOP to opt out."
+
+This message was GENERATED by Claude (the AI), not written by a
+staff member. It uses Maria's name, the specific measure, a plain
+English explanation of why it matters, and a clear action.
+It is written at a 6th-grade reading level.
+
+---
+
+THE CAMPAIGN SEQUENCE (if Maria doesn't respond):
+
+  Day 1:   SMS
+  Day 7:   Patient portal message (or SMS again if portal not opened)
+  Day 21:  Automated voice call
+  Day 42:  Mailed letter
+  Day 90:  Manual review queue — a care coordinator calls personally
+
+Each step is tracked. If Maria replies "STOP" at any point, all
+SMS messages stop immediately (TCPA compliance — immediate opt-out).
+
+---
+
+WHAT IF MARIA SAYS NO?
+
+  Maria replies: "No thanks, not interested."
+  → Status: PATIENT_DECLINED
+  → The system does NOT re-send outreach for this gap this year
+  → A care coordinator reviews whether a clinical contraindication
+    exists (has Maria been told by an ophthalmologist she doesn't
+    need the exam?)
+  → If contraindication confirmed: gap → EXCLUDED
+
+WHAT IF MARIA MAKES AN APPOINTMENT BUT DOESN'T SHOW?
+
+  The appointment no-show does NOT close the campaign.
+  After 7 days, the campaign re-activates with a gentler follow-up.
+  After TWO no-shows on the same gap, the campaign escalates to a
+  personal phone call from a care coordinator — not an automated one.
+
+WHAT IF ALL ATTEMPTS FAIL?
+
+  After Day 90 with no response: OUTREACH EXHAUSTED.
+  The case goes to a MANUAL REVIEW QUEUE for human follow-up.
+  The care coordinator may know that Maria is traveling abroad for
+  6 months, or that she is a hard-to-reach patient who needs a
+  different approach entirely.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+OUTREACH CAMPAIGN MANAGER: State machine per patient-gap pair.
+  States: PENDING → OUTREACH_SCHEDULED → CONTACTED
+    → APPOINTMENT_MADE → SERVICE_COMPLETED → (triggers gap closure)
+    → PATIENT_DECLINED → (exclusion workflow)
+    → NO_RESPONSE → next channel attempt
+    → OUTREACH_EXHAUSTED → manual review queue
+
+CHANNEL DISPATCHER: Priority logic:
+  1. Check TCPA opt-outs (if SMS opted-out → skip SMS)
+  2. Check patient preferences (if portal preferred → start with portal)
+  3. Check contact data confidence (phone confidence < 0.7 → skip phone)
+  4. Check language (template exists for preferred_language?)
+  5. Clinical urgency: if HIGH and portal not opened in 30 days → phone
+  6. Concurrent outreach lock: if payer program also outreaching → hold
+
+RESPONSE HANDLER parses SMS responses automatically:
+  "YES", "yes", "y", "ok", "sure" → appointment scheduling / lab order
+  "STOP", "stop", "unsubscribe"   → immediate opt-out
+  "NO", "no", "not interested"    → patient declined workflow
+  Anything else                   → route to front desk
+
+LLM MESSAGE GENERATION: Claude generates personalized messages using:
+  patient name, specific measure, clinical explanation, call to action.
+  Literacy target: 6th-grade reading level. Translated if needed.
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Outreach Campaign Manager ─────► Channel Dispatcher
+  Channel Dispatcher ─────────────► SMS Gateway
+  Channel Dispatcher ─────────────► Patient Portal Message
+  Channel Dispatcher ─────────────► Automated Voice
+  Channel Dispatcher ─────────────► Letter Service
+
+  (all four channels converge back to:)
+  SMS Gateway ─────────────────────► Outreach Response Handler
+  Patient Portal Message ──────────► Outreach Response Handler
+  Automated Voice ─────────────────► Outreach Response Handler
+  Letter Service ──────────────────► Outreach Response Handler
+
+  Outreach Response Handler ───────► Appointment Request Service (patient responds)
+  Outreach Response Handler ─ ─ ─ ► Patient Declined (dashed red)
+  Outreach Response Handler ─ ─ ─ ► Outreach Campaign Manager: next step (dashed yellow)
+  Outreach Campaign Manager ─ ─ ─ ► Outreach Exhausted (dashed red)
+  Outreach Exhausted ─ ─ ─ ────── ► Manual Review Queue (dashed red)
+
+YELLOW color for outreach nodes. RED dashed for error/failure paths.
+
+================================================================================
+SECTION 6 — STAGE 6: APPOINTMENT & NO-SHOW HANDLING
+  [Diagram nodes: Appointment Request Service → Gap Evidence Monitor
+                  Appointment Request Service → No Show Handler (dashed red)
+                  No Show Handler → Outreach Campaign Manager (dashed yellow)]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Maria replies "YES" to the SMS. The system routes this to the
+APPOINTMENT REQUEST SERVICE.
+
+There are two ways this can go:
+
+  OPTION A — CLINIC REFERRAL:
+  The system sends a referral request to the ophthalmology specialist.
+  An appointment is scheduled. The campaign status moves to
+  APPOINTMENT_MADE.
+
+  OPTION B — LAB ORDER (for tests, not specialist referrals):
+  For something like an A1C test, the system can create a standing
+  lab order so Maria can walk into any Quest or LabCorp location
+  without booking anything specific. The gap moves to IN_PROGRESS
+  (service pending).
+
+---
+
+WHAT IF MARIA DOESN'T SHOW?
+
+  The ophthalmologist reports a no-show. The appointment completion
+  status is NOT updated. After 24 hours with no status update,
+  the NO SHOW HANDLER fires:
+
+  "Looks like Maria's appointment didn't happen. Re-activating her
+  campaign in 7 days with a follow-up message."
+
+  After a SECOND no-show, the system escalates to a care coordinator
+  personal call — because two no-shows usually means there is a barrier
+  (transportation issue, fear, cost concern, didn't understand what
+  the exam involved).
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+APPOINTMENT REQUEST SERVICE:
+  - Sends referral to specialist EHR via FHIR $referral operation
+  - Or creates lab order via EHR API for walk-in lab visits
+  - Sets gap status → IN_PROGRESS (suppresses further outreach)
+
+NO SHOW HANDLER:
+  - Triggered when appointment status not updated within 24 hours
+    of scheduled appointment time
+  - Sets campaign status → NO_RESPONSE with "appointment_missed" note
+  - Schedules next campaign step in 7 days
+  - After 2nd no-show: escalates to MANUAL_REVIEW with "escalated" flag
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Appointment Request Service ────► Gap Evidence Monitor (appointment completed)
+  Appointment Request Service ─ ─► No Show Handler (dashed red, no-show)
+  No Show Handler ─ ─ ─ ─ ─ ─ ─► Outreach Campaign Manager
+                                   (reactivate after 7 days, dashed yellow)
+
+================================================================================
+SECTION 7 — STAGE 7: CLOSURE CONFIRMATION
+  [Diagram nodes: Note Signed Event → Gap Evidence Monitor
+   Claim Paid Event → Gap Evidence Monitor
+   Gap Evidence Monitor → Numerator Evaluator (re-evaluate)
+   Gap Evidence Monitor → Pending Result Tracker
+   Provider Attestation → Gap Evidence Monitor
+   Pending Result Tracker → Pending Result Timeout (dashed red)
+   Pending Result Timeout → Gap Record Store (reopen, dashed red)
+   Pending Result Timeout → Manual Review Queue (dashed red)]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Maria went to Dr. Nguyen (the ophthalmologist). He performed a dilated
+retinal exam. Now how does the care gap system KNOW the exam was done?
+
+There are FIVE ways a gap can be confirmed closed:
+
+  SOURCE 1 — EHR NOTE SIGNED (fastest):
+  The Medical Scribe system fires a "NoteSignedEvent" when Dr. Patel
+  (or any provider in the practice) signs a note containing relevant
+  codes. If Dr. Patel herself places the referral and documents it,
+  the gap can move to IN_PROGRESS within minutes.
+
+  SOURCE 2 — CLAIM PAID (authoritative, but slowest):
+  When BCBS pays Dr. Nguyen's claim for the eye exam, a
+  "ClaimPaidEvent" is published. This is the insurance company's
+  confirmation that the service happened and was accepted.
+  The care gap system receives this and closes the gap.
+  Timeline: 14 to 90 days after the service.
+
+  SOURCE 3 — LAB RESULT (for test-based measures):
+  If the A1C result arrives directly from Quest via HL7 message,
+  the gap evidence monitor receives it and routes it to the
+  Numerator Evaluator for immediate re-evaluation.
+
+  SOURCE 4 — HIE (for services at other facilities):
+  If Maria had her eye exam at a hospital eye clinic connected to
+  the HIE, the procedure record arrives and triggers closure.
+
+  SOURCE 5 — PROVIDER ATTESTATION (for services outside the system):
+  Dr. Patel's nurse calls Maria and learns she actually got the eye
+  exam in Taiwan during a family trip — no US insurance claim, no
+  US HIE record. The nurse can enter a PROVIDER ATTESTATION:
+  "Patient self-reported dilated retinal exam on December 15, 2025,
+  at Taipei Veterans General Hospital. Paper record on file."
+  The attestation closes the gap under HEDIS hybrid method.
+  (HEDIS allows medical record evidence to stand even without claims.)
+
+---
+
+THE PENDING RESULT TRACKER:
+
+Sometimes the system knows a service was ordered but hasn't received
+confirmation yet. For example:
+  - Dr. Patel orders an A1C today
+  - The lab draws blood tomorrow
+  - Results arrive in 48 hours
+
+During this window:
+  Gap status → IN_PROGRESS (outreach suppressed — no point texting
+  Maria about her A1C when she already has a pending order)
+
+BUT: What if the lab loses the specimen? What if Maria never went?
+The system has TIMEOUTS per test type:
+  - A1C: wait 48 hours
+  - Colonoscopy: wait 14 days (pathology report expected)
+  - Mammogram: wait 5 business days
+
+If the result does not arrive within the timeout:
+  Gap status → OPEN (reopened)
+  Provider notified: "Expected A1C result for Maria Chen not received"
+  Outreach does NOT automatically restart — provider reviews first
+
+---
+
+IMPORTANT RULE — A DENIED CLAIM DOES NOT REOPEN THE GAP:
+
+If Dr. Nguyen's claim gets denied by BCBS (billing error — wrong CPT
+code, missing modifier), the care gap system IGNORES this denial.
+A ClaimDeniedEvent means a billing mistake — it does NOT mean the
+eye exam didn't happen. If a NoteSignedEvent or HIE record already
+confirmed the exam, the gap stays CLOSED.
+
+This is a critical difference: Claim Scrubbing cares about billing.
+Care Gap cares about whether the service was performed.
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+GAP EVIDENCE MONITOR: Subscribes to:
+  - NoteSignedEvent (from Medical Scribe system)
+  - ClaimPaidEvent (from Claim Scrubbing system)
+  - HL7 lab results (from Lab Gateway)
+  - HIE procedure events
+  - Provider attestation submissions
+
+Each incoming evidence piece is stored as a GapEvidence record:
+  evidence_id, gap_id, evidence_type, source_id, service_date,
+  cpt_code, loinc_code, result_value, confidence, received_at,
+  applied_to_numerator
+
+GapEvidence is APPEND-ONLY (never updated or deleted — full audit trail).
+
+NUMERATOR EVALUATOR RE-RUN: triggered by Gap Evidence Monitor.
+Same three-phase evaluation; now with new evidence attached.
+If numerator satisfied → gap status → CLOSED.
+
+PENDING RESULT TRACKER: Stores expected_result_by timestamp per test.
+Timeout job runs every 6 hours to catch overdue results.
+
+PROVIDER ATTESTATION: Manual form stored as GapEvidence with
+evidence_type = PROVIDER_ATTESTATION, approved_by = attestor UUID.
+Satisfies HEDIS hybrid method.
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Note Signed Event ────────────────► Gap Evidence Monitor
+  Claim Paid Event  ────────────────► Gap Evidence Monitor
+  Provider Attestation ─────────────► Gap Evidence Monitor
+  Gap Evidence Monitor ─────────────► Numerator Evaluator (re-evaluate)
+  Gap Evidence Monitor ─────────────► Pending Result Tracker
+
+  Pending Result Tracker ─ ─ ─ ─ ─► Pending Result Timeout (red dashed)
+  Pending Result Timeout ─ ─ ─ ─ ─► Gap Record Store: reopen (red dashed)
+  Pending Result Timeout ─ ─ ─ ─ ─► Manual Review Queue: notify provider (red dashed)
+
+CYAN color for closure confirmation nodes.
+TEAL color for platform events (Note Signed Event, Claim Paid Event).
+
+================================================================================
+SECTION 8 — STAGE 8: QUALITY REPORTING
+  [Diagram nodes: Gap Record Store → Quality Reporting Engine →
+   HEDIS Submission / Population Dashboard / VBC Financial Report]
+================================================================================
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (plain English):
+------------------------------------------------------------------------
+
+Every time a gap closes (or opens, or is excluded), the GAP RECORD STORE
+is updated. The QUALITY REPORTING ENGINE reads from this store to answer
+three different reporting needs:
+
+  1. HEDIS SUBMISSION:
+  At year-end, insurance companies require the clinic to submit a
+  formal report showing: "Of your eligible patients, what percentage
+  met each quality measure?" This report goes to NCQA (the national
+  accreditation body) and to each payer.
+  The system generates this automatically in the required format.
+  For HEDIS Hybrid method, it includes attestation records alongside
+  claims data.
+
+  2. POPULATION DASHBOARD:
+  A real-time view for the clinic's quality team showing:
+  - How many patients have each gap open right now?
+  - Which measures are the clinic scoring lowest on?
+  - How have closure rates changed month-over-month?
+  - Which outreach campaigns are working (high response) vs. not?
+
+  3. VBC FINANCIAL REPORT:
+  The financial translation layer — takes quality performance and
+  converts it to dollar projections:
+
+    "Current diabetic eye exam rate: 74% of eligible patients.
+     BCBS Tier 2 threshold: 80%.
+     Patients needed: 6 more closures.
+     Estimated bonus at Tier 2: $47,500.
+     Revenue per eye exam closure: ~$7,917.
+     Top 6 patients by priority score: [list]"
+
+  This report tells practice managers where to focus their effort —
+  not just clinically, but financially.
+
+---
+
+FOR MARIA: When her eye exam closes, the Quality Reporting Engine:
+  - Increments the CDC-Eye numerator count for BCBS MA by 1
+  - Recalculates the clinic's CDC-Eye measure rate: now 75%
+  - Updates the VBC financial projection
+  - If this pushes the clinic to 80% → triggers bonus tier notification
+
+------------------------------------------------------------------------
+WHAT IS HAPPENING (technically):
+------------------------------------------------------------------------
+
+QUALITY REPORTING ENGINE:
+  - HEDIS Administrative method: uses claims + EHR procedure data only
+  - HEDIS Hybrid method: adds medical record attestations
+  - Output format: NCQA-specified XML/CSV per payer
+  - Medicare Advantage: Star Ratings CMS format
+  - VBC contracts: Custom P4P scorecards per contract
+
+POPULATION DASHBOARD: Materialized view updated after each gap status
+change. Aggregates by clinic_id, measure_id, hedis_year.
+
+VBC FINANCIAL REPORT: Generated on-demand per clinic, cached 24 hours.
+Priority target list: patients sorted by priority_score descending,
+filtered to gaps on VBC-contract measures where practice is near threshold.
+
+------------------------------------------------------------------------
+WHAT YOU SEE IN THE DIAGRAM:
+------------------------------------------------------------------------
+
+  Gap Record Store ──────────────► Quality Reporting Engine
+  Quality Reporting Engine ──────► HEDIS Submission
+  Quality Reporting Engine ──────► Population Dashboard
+  Quality Reporting Engine ──────► VBC Financial Report
+
+  (VBC Financial Report also feeds back to Priority Scorer —
+   see Section 4 — so new bonus-threshold data updates outreach priorities)
+
+  VBC Financial Report ──────────► Priority Scorer: financial weighting
+
+TEAL color for reporting nodes.
+
+================================================================================
+SECTION 9 — EDGE CASES (When things don't go as planned)
+================================================================================
+
+------------------------------------------------------------------------
+EDGE CASE 1: Two patients named Maria Chen
+------------------------------------------------------------------------
+
+The EMPI (identity resolution system) never matches by name alone.
+It requires DOB + sex + last name + additional fields. Two patients
+with the same name but different DOBs resolve to separate profiles.
+Their gap records are entirely independent.
+
+------------------------------------------------------------------------
+EDGE CASE 2: Maria opts out of SMS
+------------------------------------------------------------------------
+
+Maria replies STOP. The system immediately opts her out of all SMS
+campaigns. The current SMS campaign halts. But her Letter Service
+step (already queued for Day 42) can still be sent — it is a different
+channel and not subject to TCPA's electronic messaging rules.
+The next outreach attempt uses the Patient Portal or phone.
+
+------------------------------------------------------------------------
+EDGE CASE 3: Maria's insurance doesn't require this measure
+------------------------------------------------------------------------
+
+If Maria switches to a fee-for-service plan (no VBC contract), the
+HEDIS measure still runs, but:
+  - VBC Financial Impact score drops to near zero
+  - Practice Contract Weight drops to zero
+  - Priority score drops significantly
+  - Outreach still happens (it is still good medicine) but is lower priority
+  Gap records are maintained per payer overlay — one gap per
+  measure-payer combination. Her standard HEDIS gap and her BCBS
+  MA contract gap are tracked independently.
+
+------------------------------------------------------------------------
+EDGE CASE 4: HEDIS updates its rules next January
+------------------------------------------------------------------------
+
+NCQA releases updated HEDIS specifications each October.
+The update pipeline:
+  1. Ingest NCQA specification release (PDF → structured data)
+  2. Generate spec diff (what changed?)
+  3. Human review gate (quality team approves changes)
+  4. Load new MeasureSpec rows with effective_date = Jan 1 next year
+  5. On Jan 1: new specs activate; population re-evaluates
+No code deployment needed. Historical gaps evaluated under the spec
+that was active at the time they were evaluated.
+
+------------------------------------------------------------------------
+EDGE CASE 5: Eye exam done by a specialist outside this practice
+------------------------------------------------------------------------
+
+This is the most common case — specialty care at a separate office.
+Three ways the closure gets detected:
+
+  a) Payer claim: BCBS pays the ophthalmologist's claim. ClaimPaidEvent
+     arrives 14-90 days later. Gap closes.
+
+  b) HIE: If the ophthalmologist's system participates in the regional
+     HIE, the procedure record arrives faster (hours to days).
+
+  c) Patient or doctor attestation: Maria calls the clinic to report
+     the exam. Staff enters a Provider Attestation. Gap closes immediately
+     under HEDIS hybrid method.
+
+This is why having multiple closure evidence sources matters — relying
+on payer claims alone means 90-day delays in closing gaps that are
+already done.
+
+================================================================================
+SECTION 10 — THE COMPLETE FLOW IN ONE STORY
+================================================================================
+
+Let's retell the entire Maria Chen journey as one continuous narrative.
+
+------------------------------------------------------------------------
+
+MARCH 15, 2026 — 2:00 AM (Overnight batch job)
+
+The Care Gap system runs its nightly evaluation.
+Maria Chen's profile has needs_recalculation=true — her payer claims
+data refreshed yesterday.
+
+DIAGRAM: EHR + Payer Claims + IIS + HIE + Lab Gateway → Patient Identity Resolution
+
+All five data sources feed in. Maria's records match at Level 1 and 2.
+Her Longitudinal Patient Profile is assembled.
+
+DIAGRAM: Longitudinal Patient Profile → Denominator Evaluator
+
+The Measure Evaluation Engine runs 90 measures against Maria.
+Denominator phase: Maria qualifies for 12 measures (based on her age,
+sex, diagnoses, and enrollment status).
+
+DIAGRAM: Denominator Evaluator → Exclusion Evaluator
+
+Exclusion phase: No exclusions for Maria on any of her 12 measures.
+
+DIAGRAM: Exclusion Evaluator → Numerator Evaluator
+
+Numerator phase: 10 measures are CLOSED (services received within
+window). 2 measures are OPEN:
+  - CDC-Eye: Diabetic Eye Exam — last done February 2025, now overdue
+  - FLU-AD: Flu Vaccine — no flu shot this season yet
+
+DIAGRAM: Numerator Evaluator → Gap Record Store (two open gaps created)
+
+MARCH 15, 2026 — 2:15 AM
+
+Two gap records created. Priority Scorer runs.
+
+DIAGRAM: Gap Record Store → Priority Scorer
+         VBC Financial Report → Priority Scorer
+
+Maria's eye exam gap: Priority Score 88.4 (HIGH).
+Maria's flu vaccine gap: Priority Score 61.2 (MEDIUM).
+
+DIAGRAM: Priority Scorer → Outreach Campaign Manager
+
+An outreach campaign is created for Maria's eye exam gap.
+
+MARCH 15, 2026 — 9:00 AM
+
+Campaign reaches first scheduled send time.
+Channel Dispatcher: Maria has SMS consent, verified phone, English
+templates available. → SMS.
+
+DIAGRAM: Outreach Campaign Manager → Channel Dispatcher → SMS Gateway
+
+Maria receives the text about her eye exam.
+
+MARCH 17, 2026 — 10:32 AM
+
+Maria replies "Yes" to the SMS.
+
+DIAGRAM: SMS Gateway → Outreach Response Handler → Appointment Request Service
+
+Gap status → IN_PROGRESS (outreach suppresses).
+Referral sent to Dr. Nguyen's ophthalmology practice.
+
+MARCH 20, 2026 — 11:15 AM
+
+Maria sees Dr. Patel for an unrelated visit (sinus infection).
+Before Dr. Patel walks in, she sees on her Medical Scribe interface:
+
+DIAGRAM: Gap Record Store → Provider Gap Summary (→ Medical Scribe UI)
+
+  "OPEN GAP: Flu vaccine not yet given this season.
+   [Administer flu shot now →]"
+
+Dr. Patel notes the flu vaccine in the plan. She orders it.
+The Medical Scribe captures this in the transcript.
+
+MARCH 20, 2026 — 12:04 PM
+
+Dr. Patel signs the note. The Medical Scribe fires NoteSignedEvent.
+
+DIAGRAM: Note Signed Event → Gap Evidence Monitor
+
+Gap Evidence Monitor receives the note. CPT 90686 (flu vaccine) and
+CPT 90471 (vaccine administration) are in the signed codes.
+Numerator Evaluator re-runs for FLU-AD measure.
+FLU-AD gap → CLOSED.
+
+DIAGRAM: Numerator Evaluator → Gap Record Store: gap closed
+
+MARCH 28, 2026 — 3:00 PM
+
+Maria's appointment with Dr. Nguyen. Dilated retinal exam performed.
+
+MARCH 28, 2026 — 3:45 PM
+
+Dr. Nguyen's office system is connected to the regional HIE.
+A procedure record for CPT 92250 (fundus photography) arrives.
+
+DIAGRAM: HIE Connector → Patient Identity Resolution
+         → Longitudinal Patient Profile → Gap Evidence Monitor
+
+Gap Evidence Monitor receives the HIE record. Numerator Evaluator
+re-runs for CDC-Eye. The procedure is within the 12-month window.
+CDC-Eye gap → CLOSED.
+
+GapClosedEvent fires.
+
+DIAGRAM: Gap Record Store → Quality Reporting Engine
+
+Clinic's CDC-Eye measure rate: 75% (was 74%).
+VBC Financial Report updates: 5 more patients needed for Tier 2 bonus.
+
+DIAGRAM: Quality Reporting Engine → Population Dashboard
+         Quality Reporting Engine → VBC Financial Report
+         VBC Financial Report → Priority Scorer (updated financial weights)
+
+ALL DONE FOR MARIA. Both open gaps closed. No more outreach needed.
+The care gap system will not recalculate her eye exam gap until
+February 2027 (not_due_until = February 2027, set automatically
+based on her March 28 closure date).
+
+================================================================================
+SECTION 11 — QUICK REFERENCE: EVERY DIAGRAM NODE EXPLAINED
+================================================================================
+
+NODE                              WHAT IT IS
+---------------------------------------------------------------------------
+EHR Data Source (blue)            Clinic's own records. Visits, orders, labs,
+                                  diagnoses, prescriptions.
+Payer Claims Feed (blue)          Insurance claims — every service the patient
+                                  received anywhere, billed to their insurance.
+State IIS Registry (blue)         Immunization registry. Vaccines given at any
+                                  provider, pharmacy, or clinic in the state.
+HIE Connector (blue)              Health Information Exchange. Cross-facility
+                                  clinical data from hospitals, specialists.
+Lab Results Gateway (blue)        Direct lab connections (Quest, LabCorp).
+                                  Results arrive as HL7 messages.
+
+Patient Identity Resolution       "Bouncer" step. Makes sure incoming records
+  (green)                         belong to the right patient before attaching.
+Data Staging Queue (red)          Holds unmatched records waiting for human
+                                  review before they can touch a patient profile.
+Longitudinal Patient Profile      Unified health history after all matched
+  (green)                         evidence is assembled for one patient.
+
+Denominator Evaluator (purple)    Phase 1: Is this patient eligible for this
+                                  HEDIS measure? (age, sex, enrollment, diagnoses)
+Exclusion Evaluator (purple)      Phase 2: Is this patient exempt? (mastectomy,
+                                  hospice, documented contraindication)
+Numerator Evaluator (purple)      Phase 3: Has the patient received the required
+                                  service within the lookback window?
+Measure Spec Store (purple)       Versioned HEDIS rules — denominator, exclusion,
+                                  and numerator criteria per measure per year.
+
+Gap Record Store (orange)         The case file for each open gap. Status, evidence,
+                                  priority score, outreach campaign reference.
+Priority Scorer (orange)          Ranks gaps by clinical urgency + VBC financial
+                                  impact + outreach receptiveness + contract weight.
+Provider Gap Summary (orange)     Pre-encounter alert shown to the doctor before
+                                  each visit. Highest-ROI feature in the system.
+
+Outreach Campaign Manager         Tracks the full campaign state for one
+  (yellow)                        patient-gap pair. Manages the step sequence.
+Channel Dispatcher (yellow)       Decides which channel to use: SMS, portal,
+                                  phone, or letter. Checks opt-outs, preferences.
+SMS Gateway (yellow)              Sends text messages via TCPA-compliant SMS
+                                  provider (Twilio, etc.).
+Patient Portal Message (yellow)   Sends message to patient's online portal inbox.
+Automated Voice (yellow)          Places outbound automated voice call.
+Letter Service (yellow)           Generates and mails a printed letter.
+Outreach Response Handler         Parses patient replies. Routes YES/NO/STOP
+  (yellow)                        to appropriate next steps.
+
+Appointment Request Service       Sends referral to specialist or creates lab
+  (yellow)                        order. Sets gap status to IN_PROGRESS.
+No Show Handler (red)             Detects when appointment was not kept.
+                                  Re-activates campaign after 7 days.
+Patient Declined (red)            Patient said no. Enters exclusion review.
+                                  No further outreach for this gap this year.
+Outreach Exhausted (red)          All campaign steps completed with no response.
+                                  Escalates to manual review queue.
+Manual Review Queue (red)         Human care coordinator queue for complex cases,
+                                  no-shows, declined patients, result timeouts.
+
+Note Signed Event (teal)          Event from Medical Scribe system. Carries
+                                  CPT and ICD-10 codes from a signed note.
+Claim Paid Event (teal)           Event from Claim Scrubbing system. Insurance
+                                  confirmed service was performed and paid.
+
+Gap Evidence Monitor (cyan)       Watches for any incoming closure evidence
+                                  (notes, claims, labs, HIE, attestation).
+Pending Result Tracker (cyan)     Tracks expected results for ordered tests.
+                                  Fires timeout if result not received in time.
+Provider Attestation (cyan)       Manual closure entry for services performed
+                                  outside system visibility. Satisfies HEDIS hybrid.
+Manual Exclusion Registry (cyan)  Where confirmed exclusions are entered.
+                                  Used when patient has valid medical contraindication.
+Pending Result Timeout (red)      Fires when expected result does not arrive.
+                                  Reopens gap, notifies provider.
+
+Quality Reporting Engine (teal)   Aggregates gap records into reporting outputs.
+HEDIS Submission (teal)           Year-end submission to payers in NCQA format.
+Population Dashboard (teal)       Real-time view of gap performance across patients.
+VBC Financial Report (teal)       Dollar impact of current quality performance.
+                                  Also feeds priority scores (financial weighting).
+
+ARROW COLORS
+---------------------------------------------------------------------------
+Black / default  Normal primary flow — things working as expected.
+Red dashed       Error, failure, or edge case path.
+Teal dashed      Cross-system platform event (from Medical Scribe or
+                 Claim Scrubbing into Care Gap, or from Care Gap out).
+Yellow dashed    Outreach loop or retry (campaign step repeating).
+Purple           Measure evaluation internal flow.
+Orange           Gap management and prioritization flow.
+Cyan             Closure confirmation flow.
+
+================================================================================
+SECTION 12 — THE THREE MOST IMPORTANT DESIGN RULES
+================================================================================
+
+If you remember nothing else from this document, remember these three:
+
+  1. IDENTITY RESOLUTION MUST BE CORRECT BEFORE ANY EVIDENCE IS APPLIED.
+     A false patient identity match that attaches another patient's
+     eye exam result to Maria silently closes her gap. She never gets
+     follow-up. This is the most dangerous failure mode in the system.
+     That is why Level 3 (probabilistic) matches require human review
+     before evidence is applied — the cost of false closure exceeds
+     the cost of delay.
+
+  2. THE PRE-ENCOUNTER SUMMARY IS THE HIGHEST-ROI FEATURE.
+     In-visit gap closure rates are 3 to 5 times higher than
+     outreach-driven closure. When a doctor can order the A1C test,
+     administer the flu shot, or place the eye exam referral while the
+     patient is physically in the room, it happens immediately. Every
+     other feature in this system exists to support and supplement this
+     one moment. If you can only build one thing, build the pre-encounter
+     summary first.
+
+  3. A DENIED CLAIM DOES NOT REOPEN A CLOSED GAP.
+     Claim denial is a billing problem — it means a CPT code was wrong
+     or a modifier was missing. It does NOT mean the medical service
+     did not happen. If a NoteSignedEvent or lab result or HIE record
+     already confirmed the service was performed, the gap stays CLOSED.
+     The systems have separate concerns: Claim Scrubbing fixes the bill.
+     Care Gap tracks the clinical service. Never confuse the two.
+
+================================================================================
+  END OF DOCUMENT
+  Care Gap Detection & Closure — Independence OS
+  For questions, see care_gap_design.md for full technical specification.
+================================================================================
