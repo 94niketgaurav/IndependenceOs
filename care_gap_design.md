@@ -53,7 +53,7 @@ These gaps are measured against **HEDIS quality measures** — ~90 standardized 
 - **Star Ratings**: Medicare Advantage Star ratings affect premium rates
 - **Shared savings**: ACO contracts distribute shared savings based partly on quality scores
 
-A single percentage point improvement in HEDIS measure rates can be worth $50,000–$200,000 annually to a 10-provider independent practice.
+A single percentage point improvement in HEDIS (Healthcare Effectiveness Data and Information Set) measure rates can be worth $50,000–$200,000 annually to a 10-provider independent practice.
 
 ### Target Outcome
 
@@ -69,11 +69,13 @@ A single percentage point improvement in HEDIS measure rates can be worth $50,00
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │  EXTERNAL DATA SOURCES                                              │
-│  EHR ─── Payer Claims ─── State IIS ─── HIE ─── Lab Gateway       │
+│  EHR ─── Payer Claims ─── State IIS (State Immunization Information System)
+|     ─── HIE (Health Information Exchange)     ─── Lab Gateway       │
 └──────────────────────────────────┬──────────────────────────────────┘
                                    │
                ┌───────────────────▼──────────────────────┐
-               │   PATIENT IDENTITY RESOLUTION (EMPI)      │
+               │   PATIENT IDENTITY RESOLUTION (EMPI)      |
+               |     (Enterprise Master Patient Index)     │
                │   Tiered matching: deterministic →        │
                │   high-confidence → staged pending        │
                └───────────────────┬──────────────────────┘
